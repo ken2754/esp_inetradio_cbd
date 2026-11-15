@@ -33,6 +33,7 @@ static google_quota_data_t s_quota_data = {0};
 
 static volatile bool s_is_active = false;
 static volatile bool s_force_token_refresh = false;
+static volatile bool s_force_refresh = false;
 
 static char s_access_token[1024] = {0};
 static int64_t s_token_expires_at_uptime_sec = 0;
@@ -406,10 +407,11 @@ static void quota_task(void *pvParameters)
     ESP_LOGI(TAG, "Quota polling task started on Core %d", xPortGetCoreID());
 
     while (1) {
-        if (!s_is_active) {
+        if (!s_is_active && !s_force_refresh) {
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
             continue;
         }
+        s_force_refresh = false;
 
         wifi_mgr_status_t wst;
         wifi_manager_get_status(&wst);
@@ -435,7 +437,11 @@ static void quota_task(void *pvParameters)
             if (s_quota_mutex) xSemaphoreGive(s_quota_mutex);
         }
 
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(QUOTA_POLL_INTERVAL_MS));
+        if (s_is_active) {
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(QUOTA_POLL_INTERVAL_MS));
+        } else if (!s_force_refresh) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        }
     }
 }
 
@@ -455,6 +461,7 @@ void google_quota_init(void)
     s_quota_mutex = xSemaphoreCreateMutex();
     s_is_active = false;
     s_force_token_refresh = false;
+    s_force_refresh = false;
 
     memset(&s_quota_data, 0, sizeof(s_quota_data));
     init_default_window(&s_quota_data.limit_5h, "Gemini 5h");
@@ -487,7 +494,8 @@ void google_quota_set_active(bool active)
 void google_quota_request_refresh(void)
 {
     s_force_token_refresh = true;
-    if (s_is_active && s_quota_task) {
+    s_force_refresh = true;
+    if (s_quota_task) {
         xTaskNotifyGive(s_quota_task);
     }
 }

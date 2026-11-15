@@ -187,6 +187,7 @@ static int s_gest_start_bright = 80;
 static int s_gest_max_dist = 0;
 static bool s_gest_active = false;
 static bool s_gest_long_fired = false;
+static bool s_gest_ignore_until_release = false;
 static int64_t s_gest_press_us = 0;
 
 /* Double-tap vs single-tap disambiguation state */
@@ -247,7 +248,9 @@ void display_ui_set_brightness(uint8_t pct)
     if (pct < 10) pct = 10;
     if (pct > 100) pct = 100;
     s_cur_brightness = pct;
-    set_backlight_raw(pct);
+    if (s_cur_view != VIEW_SLEEP) {
+        set_backlight_raw(pct);
+    }
 }
 
 static void apply_orientation_and_color(bool invert_color, bool flip_180, bool swap_rb)
@@ -324,6 +327,15 @@ static const lv_font_t *wc_font_get(wc_font_style_t style)
         default:
             return &lv_font_montserrat_24;
     }
+}
+
+static const lv_font_t *agy_small_font_get(void)
+{
+#if defined(CONFIG_LV_FONT_MONTSERRAT_10) && CONFIG_LV_FONT_MONTSERRAT_10
+    return &lv_font_montserrat_10;
+#else
+    return &lv_font_montserrat_12;
+#endif
 }
 
 static const char *wc_font_get_name(wc_font_style_t style)
@@ -539,10 +551,13 @@ static void switch_stopped_tab(stopped_tab_t tab)
 static void switch_view(ui_view_t view)
 {
     s_cur_view = view;
+    if (s_gest_active) {
+        s_gest_ignore_until_release = true;
+    }
     s_gest_active = false;
     s_gest_mode = GEST_NONE;
-    s_gest_long_fired = false;
     s_tap_pending = false;
+    s_stop_gest_active = false;
 
     lv_obj_set_hidden(s_panel_player, view != VIEW_PLAYER);
     lv_obj_set_hidden(s_panel_wordclock, view != VIEW_WORD_CLOCK);
@@ -637,13 +652,13 @@ static void wake_from_sleep(ui_view_t target_view)
     app_config_meta_t cfg;
     app_config_get_meta(&cfg);
 
+    s_sleep_touch_armed = false;
+    s_last_activity_us = esp_timer_get_time();
+    switch_view(target_view);
     if (s_lcd_panel) {
         esp_lcd_panel_disp_on_off(s_lcd_panel, true);
     }
     display_ui_set_brightness(cfg.brightness);
-    s_sleep_touch_armed = false;
-    s_last_activity_us = esp_timer_get_time();
-    switch_view(target_view);
     ESP_LOGI(TAG, "Woke from sleep mode");
 }
 
@@ -808,6 +823,7 @@ static void on_unified_gesture_event(lv_event_t *e)
         s_last_activity_us = now_us;
         s_gest_active = true;
         s_gest_long_fired = false;
+        s_gest_ignore_until_release = false;
         s_gest_press_us = now_us;
         s_gest_start = pt;
         s_gest_last = pt;
@@ -817,7 +833,7 @@ static void on_unified_gesture_event(lv_event_t *e)
         s_gest_max_dist = 0;
     } else if (code == LV_EVENT_PRESSING) {
         s_last_activity_us = now_us;
-        if (s_gest_long_fired) return;
+        if (s_gest_long_fired || s_gest_ignore_until_release || !s_gest_active) return;
 
         s_gest_last = pt;
         int dx = (int)pt.x - (int)s_gest_start.x;
@@ -828,6 +844,7 @@ static void on_unified_gesture_event(lv_event_t *e)
         if (s_gest_mode == GEST_NONE) {
             if (s_gest_max_dist < 16 && (now_us - s_gest_press_us) >= LONG_PRESS_US) {
                 s_gest_long_fired = true;
+                s_gest_ignore_until_release = true;
                 s_tap_pending = false;
                 handle_long_press();
                 return;
@@ -858,15 +875,17 @@ static void on_unified_gesture_event(lv_event_t *e)
         }
     } else if (code == LV_EVENT_RELEASED) {
         s_last_activity_us = now_us;
-        s_gest_active = false;
         s_gest_last = pt;
         int dx = (int)pt.x - (int)s_gest_start.x;
 
-        if (s_gest_long_fired) {
+        if (s_gest_long_fired || s_gest_ignore_until_release || !s_gest_active) {
             s_gest_long_fired = false;
+            s_gest_ignore_until_release = false;
+            s_gest_active = false;
             s_gest_mode = GEST_NONE;
             return;
         }
+        s_gest_active = false;
 
         if (s_gest_mode == GEST_VERT) {
             if (s_cur_view == VIEW_PLAYER) {
@@ -909,6 +928,13 @@ static void on_unified_gesture_event(lv_event_t *e)
         }
         s_gest_mode = GEST_NONE;
     } else if (code == LV_EVENT_PRESS_LOST) {
+        if (s_gest_long_fired || s_gest_ignore_until_release || !s_gest_active) {
+            s_gest_long_fired = false;
+            s_gest_ignore_until_release = false;
+            s_gest_active = false;
+            s_gest_mode = GEST_NONE;
+            return;
+        }
         s_gest_active = false;
         if (s_gest_mode == GEST_VERT) {
             if (s_cur_view == VIEW_PLAYER) {
@@ -919,6 +945,7 @@ static void on_unified_gesture_event(lv_event_t *e)
         }
         s_gest_mode = GEST_NONE;
         s_gest_long_fired = false;
+        s_gest_ignore_until_release = false;
     }
 }
 
@@ -1120,8 +1147,8 @@ static void create_quota_slot(lv_obj_t *parent, int y_slot,
     lv_obj_set_clickable(slot->title, false);
 
     slot->val = lv_label_create(parent);
-    lv_label_set_text(slot->val, "100%");
-    lv_obj_set_style_text_color(slot->val, lv_color_hex(0x22c55e), LV_PART_MAIN);
+    lv_label_set_text(slot->val, "--%");
+    lv_obj_set_style_text_color(slot->val, lv_color_hex(0x94a3b8), LV_PART_MAIN);
     lv_obj_set_style_text_font(slot->val, &lv_font_montserrat_12, LV_PART_MAIN);
     lv_obj_align(slot->val, LV_ALIGN_TOP_RIGHT, -2, y_slot);
     lv_obj_set_clickable(slot->val, false);
@@ -1130,13 +1157,14 @@ static void create_quota_slot(lv_obj_t *parent, int y_slot,
     lv_obj_set_size(slot->bar, 150, 7);
     lv_obj_align(slot->bar, LV_ALIGN_TOP_LEFT, 2, y_slot + 16);
     lv_bar_set_range(slot->bar, 0, 100);
-    lv_bar_set_value(slot->bar, 100, LV_ANIM_OFF);
+    lv_bar_set_value(slot->bar, 0, LV_ANIM_OFF);
     lv_obj_set_style_radius(slot->bar, 3, LV_PART_MAIN);
     lv_obj_set_style_radius(slot->bar, 3, LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(slot->bar, lv_color_hex(0x27272a), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(slot->bar, LV_OPA_80, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(slot->bar, LV_OPA_COVER, LV_PART_INDICATOR);
-    set_bar_color_by_val(slot->bar, 100);
+    lv_obj_set_style_bg_color(slot->bar, lv_color_hex(0x3f3f46), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_grad_dir(slot->bar, LV_GRAD_DIR_NONE, LV_PART_INDICATOR);
     lv_obj_set_clickable(slot->bar, false);
 
     slot->reset = lv_label_create(parent);
@@ -1144,7 +1172,7 @@ static void create_quota_slot(lv_obj_t *parent, int y_slot,
     lv_obj_set_width(slot->reset, 150);
     lv_label_set_long_mode(slot->reset, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_color(slot->reset, lv_color_hex(0xd4d4d8), LV_PART_MAIN);
-    lv_obj_set_style_text_font(slot->reset, &lv_font_montserrat_10, LV_PART_MAIN);
+    lv_obj_set_style_text_font(slot->reset, agy_small_font_get(), LV_PART_MAIN);
     lv_obj_align(slot->reset, LV_ALIGN_TOP_LEFT, 2, y_slot + 26);
     lv_obj_set_clickable(slot->reset, false);
 
@@ -1167,14 +1195,22 @@ static void update_quota_slot(quota_slot_ui_t *slot, const quota_window_t *windo
         lv_label_set_text(slot->title, window->name);
     }
 
-    int p = (int)(window->remaining_fraction * 100.0f);
-    if (p < 0) p = 0;
-    if (p > 100) p = 100;
+    if (!window->valid) {
+        lv_bar_set_value(slot->bar, 0, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(slot->bar, lv_color_hex(0x3f3f46), LV_PART_INDICATOR);
+        lv_obj_set_style_bg_grad_dir(slot->bar, LV_GRAD_DIR_NONE, LV_PART_INDICATOR);
+        lv_label_set_text(slot->val, "--%");
+        lv_obj_set_style_text_color(slot->val, lv_color_hex(0x94a3b8), LV_PART_MAIN);
+    } else {
+        int p = (int)(window->remaining_fraction * 100.0f);
+        if (p < 0) p = 0;
+        if (p > 100) p = 100;
 
-    lv_bar_set_value(slot->bar, p, LV_ANIM_OFF);
-    set_bar_color_by_val(slot->bar, p);
-    lv_label_set_text_fmt(slot->val, "%d%%", p);
-    lv_obj_set_style_text_color(slot->val, get_quota_color_by_val(p), LV_PART_MAIN);
+        lv_bar_set_value(slot->bar, p, LV_ANIM_OFF);
+        set_bar_color_by_val(slot->bar, p);
+        lv_label_set_text_fmt(slot->val, "%d%%", p);
+        lv_obj_set_style_text_color(slot->val, get_quota_color_by_val(p), LV_PART_MAIN);
+    }
 
     lv_obj_set_style_text_color(slot->reset, lv_color_hex(0xd4d4d8), LV_PART_MAIN);
     if (strcmp(lv_label_get_text(slot->reset), window->reset_time_str) != 0) {
@@ -1320,6 +1356,12 @@ static void update_agy_dashboard_view(const player_status_t *pst, const wifi_mgr
         s_q_last_has_error = qd.has_error;
         snprintf(s_q_last_err_msg, sizeof(s_q_last_err_msg), "%s", qd.error_msg);
 
+        update_quota_slot(&s_q_slots[0], &qd.limit_5h);
+        update_quota_slot(&s_q_slots[1], &qd.limit_weekly);
+        update_quota_slot(&s_q_slots[2], &qd.limit_claude_5h);
+        update_quota_slot(&s_q_slots[3], &qd.limit_claude_wk);
+        update_quota_slot(&s_q_slots[4], &qd.limit_argon);
+
         if (qd.has_error) {
             for (int i = 0; i < 5; i++) {
                 lv_obj_set_style_text_color(s_q_slots[i].reset, lv_color_hex(0xf87171), LV_PART_MAIN);
@@ -1330,12 +1372,6 @@ static void update_agy_dashboard_view(const player_status_t *pst, const wifi_mgr
                 lv_obj_set_style_text_color(s_q_slots[i].reset, lv_color_hex(0xd4d4d8), LV_PART_MAIN);
                 lv_label_set_text(s_q_slots[i].reset, "Fetching quota...");
             }
-        } else {
-            update_quota_slot(&s_q_slots[0], &qd.limit_5h);
-            update_quota_slot(&s_q_slots[1], &qd.limit_weekly);
-            update_quota_slot(&s_q_slots[2], &qd.limit_claude_5h);
-            update_quota_slot(&s_q_slots[3], &qd.limit_claude_wk);
-            update_quota_slot(&s_q_slots[4], &qd.limit_argon);
         }
     }
 }
@@ -1425,9 +1461,11 @@ static void ui_timer_cb(lv_timer_t *timer)
     s_prev_player_state = pst.state;
 
     /* Long-press check while finger is stationary */
-    if (s_gest_active && !s_gest_long_fired && s_gest_mode == GEST_NONE && s_gest_max_dist < 16) {
+    if (s_gest_active && !s_gest_long_fired && !s_gest_ignore_until_release &&
+        s_gest_mode == GEST_NONE && s_gest_max_dist < 16) {
         if ((now_us - s_gest_press_us) >= LONG_PRESS_US) {
             s_gest_long_fired = true;
+            s_gest_ignore_until_release = true;
             s_tap_pending = false;
             handle_long_press();
         }
@@ -1746,7 +1784,7 @@ static void build_ui(void)
     lv_label_set_long_mode(s_db_label_wifi, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(s_db_label_wifi, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(s_db_label_wifi, lv_color_hex(0xd4d4d8), LV_PART_MAIN);
-    lv_obj_set_style_text_font(s_db_label_wifi, &lv_font_montserrat_10, LV_PART_MAIN);
+    lv_obj_set_style_text_font(s_db_label_wifi, agy_small_font_get(), LV_PART_MAIN);
     lv_obj_align(s_db_label_wifi, LV_ALIGN_TOP_MID, 0, 4);
     lv_obj_set_clickable(s_db_label_wifi, false);
 
@@ -1781,7 +1819,7 @@ static void build_ui(void)
     lv_label_set_long_mode(s_db_label_status, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(s_db_label_status, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(s_db_label_status, lv_color_hex(0x94a3b8), LV_PART_MAIN);
-    lv_obj_set_style_text_font(s_db_label_status, &lv_font_montserrat_10, LV_PART_MAIN);
+    lv_obj_set_style_text_font(s_db_label_status, agy_small_font_get(), LV_PART_MAIN);
     lv_obj_align(s_db_label_status, LV_ALIGN_BOTTOM_MID, 0, -4);
     lv_obj_set_clickable(s_db_label_status, false);
 
