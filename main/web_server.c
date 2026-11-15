@@ -2,9 +2,13 @@
 #include "app_config.h"
 #include "audio_player.h"
 #include "display_ui.h"
+#include "google_quota.h"
+#include "sntp_time.h"
 #include "web_ui.h"
 #include "wifi_manager.h"
 
+#include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "cJSON.h"
@@ -89,6 +93,9 @@ static esp_err_t handle_status_get(httpd_req_t *req)
     wifi_manager_get_status(&wst);
     app_config_meta_t cfg;
     app_config_get_meta(&cfg);
+    clock_display_time_t clk;
+    sntp_time_get_current(&clk);
+    const char *view_name = display_ui_get_view_name();
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "state_text", state_to_str(pst.state));
@@ -120,6 +127,10 @@ static esp_err_t handle_status_get(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "invert_color", cfg.invert_color);
     cJSON_AddBoolToObject(root, "flip_180", cfg.flip_180);
     cJSON_AddBoolToObject(root, "swap_rb", cfg.swap_rb);
+
+    cJSON_AddStringToObject(root, "view", view_name ? view_name : "player");
+    cJSON_AddStringToObject(root, "time_str", clk.time_str);
+    cJSON_AddBoolToObject(root, "time_synced", clk.is_synced);
 
     return send_json(req, root);
 }
@@ -156,7 +167,14 @@ static esp_err_t handle_control_post(httpd_req_t *req)
         } else if (strcmp(a, "mute") == 0) {
             cJSON *m = cJSON_GetObjectItem(body, "muted");
             audio_player_set_mute(cJSON_IsBool(m) ? cJSON_IsTrue(m) : !audio_player_is_muted());
+        } else if (strcmp(a, "refresh_quota") == 0) {
+            google_quota_request_refresh();
         }
+    }
+
+    cJSON *vw = cJSON_GetObjectItem(body, "view");
+    if (cJSON_IsString(vw) && vw->valuestring[0] != '\0') {
+        display_ui_switch_view_by_name(vw->valuestring);
     }
 
     cJSON *vol = cJSON_GetObjectItem(body, "volume");
@@ -373,6 +391,280 @@ static esp_err_t handle_display_post(httpd_req_t *req)
     return send_ok(req);
 }
 
+static bool copy_trimmed_if_nonempty(char *dst, size_t dst_len, const char *src, bool *changed)
+{
+    if (!src || !dst || dst_len == 0) return false;
+    const char *start = src;
+    while (*start && isspace((unsigned char)*start)) start++;
+    const char *end = start + strlen(start);
+    while (end > start && isspace((unsigned char)*(end - 1))) end--;
+    size_t len = (size_t)(end - start);
+    if (len == 0) return false;
+    if (len >= dst_len) len = dst_len - 1;
+    if (changed && (strlen(dst) != len || strncmp(dst, start, len) != 0)) {
+        *changed = true;
+    }
+    memcpy(dst, start, len);
+    dst[len] = '\0';
+    return true;
+}
+
+static void add_quota_window(cJSON *arr, const quota_window_t *w)
+{
+    cJSON *item = cJSON_CreateObject();
+    cJSON_AddBoolToObject(item, "valid", w->valid);
+    cJSON_AddStringToObject(item, "name", w->name);
+    cJSON_AddNumberToObject(item, "remaining_fraction", (double)w->remaining_fraction);
+    cJSON_AddStringToObject(item, "reset_time_str", w->reset_time_str);
+    cJSON_AddItemToArray(arr, item);
+}
+
+static esp_err_t handle_agy_get(httpd_req_t *req)
+{
+    app_agy_config_t agy;
+    app_config_get_agy(&agy);
+    google_quota_data_t qd;
+    google_quota_get_data(&qd);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "timezone", agy.timezone);
+    cJSON_AddNumberToObject(root, "wc_font_mode", agy.wc_font_mode);
+    cJSON_AddNumberToObject(root, "idle_clock_sec", agy.idle_clock_sec);
+    cJSON_AddNumberToObject(root, "idle_clock_view", agy.idle_clock_view);
+    cJSON_AddBoolToObject(root, "has_cid", agy.oauth_client_id[0] != '\0');
+    cJSON_AddBoolToObject(root, "has_sec", agy.oauth_client_secret[0] != '\0');
+    cJSON_AddBoolToObject(root, "has_refr", agy.oauth_refresh_token[0] != '\0');
+    cJSON_AddStringToObject(root, "oauth_client_id", agy.oauth_client_id);
+
+    cJSON *quota = cJSON_CreateObject();
+    cJSON_AddBoolToObject(quota, "is_loading", qd.is_loading);
+    cJSON_AddBoolToObject(quota, "has_error", qd.has_error);
+    cJSON_AddStringToObject(quota, "error_msg", qd.error_msg);
+    cJSON_AddNumberToObject(quota, "last_update_sec", (double)qd.last_update_sec);
+
+    cJSON *windows = cJSON_CreateArray();
+    add_quota_window(windows, &qd.limit_5h);
+    add_quota_window(windows, &qd.limit_weekly);
+    add_quota_window(windows, &qd.limit_claude_5h);
+    add_quota_window(windows, &qd.limit_claude_wk);
+    add_quota_window(windows, &qd.limit_argon);
+    cJSON_AddItemToObject(quota, "windows", windows);
+
+    cJSON_AddItemToObject(root, "quota", quota);
+    return send_json(req, root);
+}
+
+static esp_err_t handle_agy_post(httpd_req_t *req)
+{
+    cJSON *body = recv_json_body(req);
+    if (!body) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+
+    app_agy_config_t agy;
+    app_config_get_agy(&agy);
+
+    bool creds_changed = false;
+    bool refresh_requested = false;
+    cJSON *j;
+
+    if ((j = cJSON_GetObjectItem(body, "timezone")) && cJSON_IsString(j)) {
+        copy_trimmed_if_nonempty(agy.timezone, sizeof(agy.timezone), j->valuestring, NULL);
+    }
+    if ((j = cJSON_GetObjectItem(body, "wc_font_mode")) && cJSON_IsNumber(j)) {
+        int fm = j->valueint;
+        if (fm < 0) fm = 0;
+        if (fm > 4) fm = 4;
+        agy.wc_font_mode = (uint8_t)fm;
+    }
+    if ((j = cJSON_GetObjectItem(body, "idle_clock_sec")) && cJSON_IsNumber(j)) {
+        int sec = j->valueint;
+        if (sec < 0) sec = 0;
+        if (sec > 65535) sec = 65535;
+        agy.idle_clock_sec = (uint16_t)sec;
+    }
+    if ((j = cJSON_GetObjectItem(body, "idle_clock_view")) && cJSON_IsNumber(j)) {
+        agy.idle_clock_view = (j->valueint == 1) ? 1 : 0;
+    }
+
+    if ((j = cJSON_GetObjectItem(body, "cid")) && cJSON_IsString(j)) {
+        copy_trimmed_if_nonempty(agy.oauth_client_id, sizeof(agy.oauth_client_id), j->valuestring, &creds_changed);
+    } else if ((j = cJSON_GetObjectItem(body, "oauth_client_id")) && cJSON_IsString(j)) {
+        copy_trimmed_if_nonempty(agy.oauth_client_id, sizeof(agy.oauth_client_id), j->valuestring, &creds_changed);
+    }
+
+    if ((j = cJSON_GetObjectItem(body, "sec")) && cJSON_IsString(j)) {
+        copy_trimmed_if_nonempty(agy.oauth_client_secret, sizeof(agy.oauth_client_secret), j->valuestring, &creds_changed);
+    } else if ((j = cJSON_GetObjectItem(body, "oauth_client_secret")) && cJSON_IsString(j)) {
+        copy_trimmed_if_nonempty(agy.oauth_client_secret, sizeof(agy.oauth_client_secret), j->valuestring, &creds_changed);
+    }
+
+    if ((j = cJSON_GetObjectItem(body, "refr")) && cJSON_IsString(j)) {
+        copy_trimmed_if_nonempty(agy.oauth_refresh_token, sizeof(agy.oauth_refresh_token), j->valuestring, &creds_changed);
+    } else if ((j = cJSON_GetObjectItem(body, "oauth_refresh_token")) && cJSON_IsString(j)) {
+        copy_trimmed_if_nonempty(agy.oauth_refresh_token, sizeof(agy.oauth_refresh_token), j->valuestring, &creds_changed);
+    }
+
+    if ((j = cJSON_GetObjectItem(body, "refresh")) && cJSON_IsBool(j) && cJSON_IsTrue(j)) {
+        refresh_requested = true;
+    }
+
+    cJSON_Delete(body);
+
+    esp_err_t err = app_config_set_agy(&agy);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save Agy config");
+        return ESP_FAIL;
+    }
+
+    sntp_time_update_tz(agy.timezone);
+    display_ui_apply_agy_settings();
+    if (creds_changed || refresh_requested) {
+        google_quota_request_refresh();
+    }
+
+    return send_ok(req);
+}
+
+static void url_decode(char *dst, size_t dst_size, const char *src, size_t src_len)
+{
+    if (!dst || dst_size == 0) return;
+    size_t i = 0;
+    size_t s = 0;
+    while (s < src_len && src[s] != '\0' && i < dst_size - 1) {
+        if (src[s] == '%' && s + 2 < src_len &&
+            isxdigit((unsigned char)src[s + 1]) &&
+            isxdigit((unsigned char)src[s + 2])) {
+            char hex_buf[3] = { src[s + 1], src[s + 2], '\0' };
+            dst[i++] = (char)strtol(hex_buf, NULL, 16);
+            s += 3;
+        } else if (src[s] == '+') {
+            dst[i++] = ' ';
+            s++;
+        } else {
+            dst[i++] = src[s++];
+        }
+    }
+    dst[i] = '\0';
+}
+
+static bool extract_form_param(const char *post_data, const char *key, char *out, size_t out_len)
+{
+    if (!post_data || !key || !out || out_len == 0) return false;
+    size_t key_len = strlen(key);
+    const char *p = post_data;
+    while (*p) {
+        const char *eq = strchr(p, '=');
+        const char *amp = strchr(p, '&');
+        size_t seg_end = amp ? (size_t)(amp - p) : strlen(p);
+        if (eq && (size_t)(eq - p) == key_len && strncmp(p, key, key_len) == 0) {
+            const char *val = eq + 1;
+            size_t val_len = seg_end - (size_t)(val - p);
+            url_decode(out, out_len, val, val_len);
+            return true;
+        }
+        if (!amp) break;
+        p = amp + 1;
+    }
+    return false;
+}
+
+static esp_err_t handle_save_post(httpd_req_t *req)
+{
+    int total = req->content_len;
+    if (total <= 0 || total > 8192) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid payload size");
+        return ESP_FAIL;
+    }
+
+    char *buf = malloc((size_t)total + 1);
+    char *val = malloc(640);
+    if (!buf || !val) {
+        free(buf);
+        free(val);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+
+    int received = 0;
+    while (received < total) {
+        int r = httpd_req_recv(req, buf + received, total - received);
+        if (r <= 0) {
+            if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+            free(buf);
+            free(val);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive failed");
+            return ESP_FAIL;
+        }
+        received += r;
+    }
+    buf[received] = '\0';
+
+    app_agy_config_t agy;
+    app_config_get_agy(&agy);
+
+    bool creds_changed = false;
+    bool oauth_provided = false;
+
+    if (extract_form_param(buf, "cid", val, 640)) {
+        if (copy_trimmed_if_nonempty(agy.oauth_client_id, sizeof(agy.oauth_client_id), val, &creds_changed)) {
+            oauth_provided = true;
+        }
+    }
+    if (extract_form_param(buf, "sec", val, 640)) {
+        if (copy_trimmed_if_nonempty(agy.oauth_client_secret, sizeof(agy.oauth_client_secret), val, &creds_changed)) {
+            oauth_provided = true;
+        }
+    }
+    if (extract_form_param(buf, "refr", val, 640)) {
+        if (copy_trimmed_if_nonempty(agy.oauth_refresh_token, sizeof(agy.oauth_refresh_token), val, &creds_changed)) {
+            oauth_provided = true;
+        }
+    }
+    if (extract_form_param(buf, "tz", val, 640)) {
+        copy_trimmed_if_nonempty(agy.timezone, sizeof(agy.timezone), val, NULL);
+    }
+    if (extract_form_param(buf, "font", val, 640) && val[0] != '\0') {
+        int fm = atoi(val);
+        if (fm < 0) fm = 0;
+        if (fm > 4) fm = 4;
+        agy.wc_font_mode = (uint8_t)fm;
+    }
+    if (extract_form_param(buf, "bright", val, 640) && val[0] != '\0') {
+        int b = atoi(val);
+        if (b < 10) b = 10;
+        if (b > 100) b = 100;
+        app_config_set_brightness((uint8_t)b);
+        display_ui_set_brightness((uint8_t)b);
+    }
+
+    free(buf);
+    free(val);
+
+    esp_err_t err = app_config_set_agy(&agy);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save Agy config");
+        return ESP_FAIL;
+    }
+
+    sntp_time_update_tz(agy.timezone);
+    display_ui_apply_agy_settings();
+    if (creds_changed || oauth_provided) {
+        google_quota_request_refresh();
+    }
+
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req,
+        "<html><body style='background:#0b1120;color:#f8fafc;font-family:sans-serif;padding:24px;text-align:center;'>"
+        "<h2 style='color:#38bdf8;'>Settings Saved</h2>"
+        "<p>Configuration applied.</p>"
+        "<p><a href='/' style='color:#38bdf8;'>&larr; Back</a></p>"
+        "</body></html>",
+        HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t handle_404_captive(httpd_req_t *req, httpd_err_code_t err)
 {
     (void)err;
@@ -387,7 +679,7 @@ esp_err_t web_server_start(void)
     if (s_server != NULL) return ESP_OK;
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 20;
     config.stack_size = 6144;
     config.lru_purge_enable = true;
 
@@ -405,6 +697,9 @@ esp_err_t web_server_start(void)
         { .uri = "/api/wifi/scan",      .method = HTTP_GET,    .handler = handle_wifi_scan_get },
         { .uri = "/api/wifi",           .method = HTTP_POST,   .handler = handle_wifi_post },
         { .uri = "/api/display",        .method = HTTP_POST,   .handler = handle_display_post },
+        { .uri = "/api/agy",            .method = HTTP_GET,    .handler = handle_agy_get },
+        { .uri = "/api/agy",            .method = HTTP_POST,   .handler = handle_agy_post },
+        { .uri = "/save",               .method = HTTP_POST,   .handler = handle_save_post },
     };
 
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
