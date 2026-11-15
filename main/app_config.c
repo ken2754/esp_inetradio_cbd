@@ -13,6 +13,8 @@ static const char *TAG = "app_config";
 #define NVS_NAMESPACE   "radio_cfg"
 #define NVS_KEY_META    "meta_v2"
 #define NVS_KEY_ST_FMT  "st_%d"
+#define NVS_KEY_AGY     "agy_v1"
+#define DEFAULT_AGY_TZ  "JST-9"
 
 typedef struct {
     app_config_meta_t meta;
@@ -20,7 +22,19 @@ typedef struct {
 } app_config_t;
 
 static app_config_t s_cfg;
+static app_agy_config_t s_agy;
 static SemaphoreHandle_t s_cfg_mutex = NULL;
+
+static void safe_copy_str(char *dst, size_t dst_len, const char *src)
+{
+    if (!dst || dst_len == 0) return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    strncpy(dst, src, dst_len - 1);
+    dst[dst_len - 1] = '\0';
+}
 
 static const radio_station_t s_default_somafm_stations[] = {
     {
@@ -92,7 +106,16 @@ static void load_defaults_locked(void)
     load_default_stations_locked();
 }
 
-static esp_err_t save_meta_locked(void)
+static void load_agy_defaults_locked(void)
+{
+    memset(&s_agy, 0, sizeof(s_agy));
+    safe_copy_str(s_agy.timezone, sizeof(s_agy.timezone), DEFAULT_AGY_TZ);
+    s_agy.wc_font_mode = 0;
+    s_agy.idle_clock_sec = 0;
+    s_agy.idle_clock_view = 0;
+}
+
+static esp_err_t save_blob_locked(const char *key, const void *data, size_t len)
 {
     nvs_handle_t handle;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
@@ -101,16 +124,26 @@ static esp_err_t save_meta_locked(void)
         return err;
     }
 
-    err = nvs_set_blob(handle, NVS_KEY_META, &s_cfg.meta, sizeof(s_cfg.meta));
+    err = nvs_set_blob(handle, key, data, len);
     if (err == ESP_OK) {
         err = nvs_commit(handle);
     }
     nvs_close(handle);
 
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to save meta: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to save %s: %s", key, esp_err_to_name(err));
     }
     return err;
+}
+
+static esp_err_t save_meta_locked(void)
+{
+    return save_blob_locked(NVS_KEY_META, &s_cfg.meta, sizeof(s_cfg.meta));
+}
+
+static esp_err_t save_agy_locked(void)
+{
+    return save_blob_locked(NVS_KEY_AGY, &s_agy, sizeof(s_agy));
 }
 
 static esp_err_t save_all_locked(void)
@@ -204,6 +237,32 @@ esp_err_t app_config_init(void)
         save_all_locked();
     }
 
+    bool agy_loaded = false;
+    err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_OK) {
+        size_t agy_size = sizeof(s_agy);
+        err = nvs_get_blob(handle, NVS_KEY_AGY, &s_agy, &agy_size);
+        if (err == ESP_OK && agy_size == sizeof(s_agy)) {
+            s_agy.timezone[sizeof(s_agy.timezone) - 1] = '\0';
+            if (s_agy.timezone[0] == '\0') {
+                safe_copy_str(s_agy.timezone, sizeof(s_agy.timezone), DEFAULT_AGY_TZ);
+            }
+            s_agy.oauth_client_id[sizeof(s_agy.oauth_client_id) - 1] = '\0';
+            s_agy.oauth_client_secret[sizeof(s_agy.oauth_client_secret) - 1] = '\0';
+            s_agy.oauth_refresh_token[sizeof(s_agy.oauth_refresh_token) - 1] = '\0';
+            agy_loaded = true;
+            ESP_LOGI(TAG, "Loaded agy config from NVS (tz='%s', idle=%us)",
+                     s_agy.timezone, (unsigned)s_agy.idle_clock_sec);
+        }
+        nvs_close(handle);
+    }
+
+    if (!agy_loaded) {
+        ESP_LOGI(TAG, "Initializing default agy config (tz='%s')", DEFAULT_AGY_TZ);
+        load_agy_defaults_locked();
+        save_agy_locked();
+    }
+
     xSemaphoreGive(s_cfg_mutex);
     return ESP_OK;
 }
@@ -234,17 +293,6 @@ bool app_config_get_station(int index, radio_station_t *out_station)
     }
     xSemaphoreGive(s_cfg_mutex);
     return ok;
-}
-
-static void safe_copy_str(char *dst, size_t dst_len, const char *src)
-{
-    if (!dst || dst_len == 0) return;
-    if (!src) {
-        dst[0] = '\0';
-        return;
-    }
-    strncpy(dst, src, dst_len - 1);
-    dst[dst_len - 1] = '\0';
 }
 
 esp_err_t app_config_add_station(const char *name, const char *url, const char *genre)
@@ -413,6 +461,51 @@ esp_err_t app_config_set_display(uint8_t brightness, bool invert_color, bool fli
     s_cfg.meta.flip_180 = flip_180;
     s_cfg.meta.swap_rb = swap_rb;
     esp_err_t err = save_meta_locked();
+    xSemaphoreGive(s_cfg_mutex);
+    return err;
+}
+
+esp_err_t app_config_set_brightness(uint8_t brightness)
+{
+    if (brightness < 10) brightness = 10;
+    if (brightness > 100) brightness = 100;
+    xSemaphoreTake(s_cfg_mutex, portMAX_DELAY);
+    s_cfg.meta.brightness = brightness;
+    esp_err_t err = save_meta_locked();
+    xSemaphoreGive(s_cfg_mutex);
+    return err;
+}
+
+void app_config_get_agy(app_agy_config_t *out_agy)
+{
+    if (!out_agy) return;
+    xSemaphoreTake(s_cfg_mutex, portMAX_DELAY);
+    memcpy(out_agy, &s_agy, sizeof(app_agy_config_t));
+    xSemaphoreGive(s_cfg_mutex);
+}
+
+esp_err_t app_config_set_agy(const app_agy_config_t *agy)
+{
+    if (!agy) return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(s_cfg_mutex, portMAX_DELAY);
+    safe_copy_str(s_agy.timezone, sizeof(s_agy.timezone),
+                  (agy->timezone[0] != '\0') ? agy->timezone : DEFAULT_AGY_TZ);
+    s_agy.wc_font_mode = agy->wc_font_mode;
+    s_agy.idle_clock_sec = agy->idle_clock_sec;
+    s_agy.idle_clock_view = agy->idle_clock_view;
+    safe_copy_str(s_agy.oauth_client_id, sizeof(s_agy.oauth_client_id), agy->oauth_client_id);
+    safe_copy_str(s_agy.oauth_client_secret, sizeof(s_agy.oauth_client_secret), agy->oauth_client_secret);
+    safe_copy_str(s_agy.oauth_refresh_token, sizeof(s_agy.oauth_refresh_token), agy->oauth_refresh_token);
+    esp_err_t err = save_agy_locked();
+    xSemaphoreGive(s_cfg_mutex);
+    return err;
+}
+
+esp_err_t app_config_set_wc_font(uint8_t font_mode)
+{
+    xSemaphoreTake(s_cfg_mutex, portMAX_DELAY);
+    s_agy.wc_font_mode = font_mode;
+    esp_err_t err = save_agy_locked();
     xSemaphoreGive(s_cfg_mutex);
     return err;
 }

@@ -12,6 +12,8 @@
 #include "audio_player.h"
 #include "board_config.h"
 #include "display_ui.h"
+#include "google_quota.h"
+#include "sntp_time.h"
 #include "web_server.h"
 #include "wifi_manager.h"
 
@@ -78,6 +80,8 @@ void app_main(void)
     ESP_ERROR_CHECK(audio_player_init(i2c_bus));
     ESP_ERROR_CHECK(display_ui_init(i2c_bus));
     ESP_ERROR_CHECK(wifi_manager_init());
+    ESP_ERROR_CHECK(sntp_time_init(NULL));
+    google_quota_init();
     ESP_ERROR_CHECK(web_server_start());
 
     xTaskCreate(boot_button_task, "boot_btn", 4096, NULL, 2, NULL);

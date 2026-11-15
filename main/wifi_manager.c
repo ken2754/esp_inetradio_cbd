@@ -1,6 +1,7 @@
 #include "wifi_manager.h"
 #include "app_config.h"
 #include "audio_player.h"
+#include "sntp_time.h"
 
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -200,6 +201,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         }
 
         start_mdns_once();
+        sntp_time_restart();
         xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
 
         if (cfg.autoplay && !s_auto_played_once) {

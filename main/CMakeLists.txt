@@ -7,6 +7,9 @@ idf_component_register(
         "display_ui.c"
         "wifi_manager.c"
         "web_server.c"
+        "sntp_time.c"
+        "word_clock.c"
+        "google_quota.c"
     INCLUDE_DIRS "."
     REQUIRES
         nvs_flash
