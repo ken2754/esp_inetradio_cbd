@@ -20,23 +20,48 @@
 
 static const char *TAG = "album_art";
 
+#define ART_COVER_SIZE          240
+#define ART_WING_W              ((ALBUM_ART_WIDTH - ART_COVER_SIZE) / 2)
 #define ART_HTTP_MAX_JSON_BYTES (16 * 1024)
-#define ART_HTTP_MAX_IMG_BYTES  (96 * 1024)
+#define ART_HTTP_MAX_IMG_BYTES  (128 * 1024)
 #define TJPGD_WORK_BUF_SIZE     4096
+
+#define ART_CACHE_SLOTS         4
+#define ART_JOB_QUEUE_LEN       4
+
+typedef struct {
+    uint32_t art_id;
+    int station_index;
+    char artist[96];
+    char track[128];
+    bool in_use;
+    bool ready;
+    bool is_cover;
+    uint16_t *pixels;
+} art_slot_t;
+
+typedef struct {
+    uint32_t art_id;
+    int station_index;
+    char artist[96];
+    char track[128];
+} art_job_t;
 
 static SemaphoreHandle_t s_art_mutex = NULL;
 static TaskHandle_t s_art_task = NULL;
 
-static uint16_t *s_active_pixels = NULL;
+static art_slot_t s_slots[ART_CACHE_SLOTS];
 static uint16_t *s_scratch_pixels = NULL;
-static bool s_active_is_cover = false;
+static int s_active_slot = 0;
 static uint32_t s_art_version = 0;
+static uint32_t s_next_art_id = 1;
+static uint32_t s_committed_art_id = 0;
+static uint32_t s_clear_gen = 0;
 
-/* Pending request state guarded by s_art_mutex */
-static int s_req_station = 0;
-static char s_req_artist[96] = {0};
-static char s_req_track[128] = {0};
-static uint32_t s_req_gen = 0;
+static art_job_t s_job_q[ART_JOB_QUEUE_LEN];
+static int s_job_head = 0;
+static int s_job_tail = 0;
+static int s_job_count = 0;
 
 typedef struct {
     uint8_t *buf;
@@ -68,7 +93,14 @@ static inline uint16_t rgb565_make(uint8_t r, uint8_t g, uint8_t b)
     return (uint16_t)(((r & 0xF8U) << 8) | ((g & 0xFCU) << 3) | (b >> 3));
 }
 
-/* Render a clean dark vinyl/gradient card tinted subtly by station index */
+static inline void rgb565_split(uint16_t c, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    *r = (uint8_t)((c >> 8) & 0xF8U);
+    *g = (uint8_t)((c >> 3) & 0xFCU);
+    *b = (uint8_t)((c << 3) & 0xF8U);
+}
+
+/* Render full 320x240 dark vinyl/gradient card tinted subtly by station index */
 static void render_fallback_art(uint16_t *dst, int station_index)
 {
     static const uint8_t palette[][3] = {
@@ -96,36 +128,30 @@ static void render_fallback_art(uint16_t *dst, int station_index)
             int dy = y - cy;
             int d2 = dx * dx + dy * dy;
 
-            /* Base diagonal dark slate gradient with subtle accent tint */
-            int mix = (x + y) * 32 / (ALBUM_ART_WIDTH + ALBUM_ART_HEIGHT);
-            uint8_t r = (uint8_t)(16 + (ar * mix) / 255);
-            uint8_t g = (uint8_t)(23 + (ag * mix) / 255);
-            uint8_t b = (uint8_t)(40 + (ab * mix) / 255);
+            int mix = (x + y) * 34 / (ALBUM_ART_WIDTH + ALBUM_ART_HEIGHT);
+            uint8_t r = (uint8_t)(12 + (ar * mix) / 255);
+            uint8_t g = (uint8_t)(18 + (ag * mix) / 255);
+            uint8_t b = (uint8_t)(34 + (ab * mix) / 255);
 
-            if (d2 <= 46 * 46) {
-                /* Vinyl disc body */
-                if (d2 <= 6 * 6) {
-                    /* Spindle hole */
-                    r = 12; g = 16; b = 26;
-                } else if (d2 <= 18 * 18) {
-                    /* Colored center label */
+            if (d2 <= 94 * 94) {
+                if (d2 <= 10 * 10) {
+                    r = 10; g = 14; b = 22;
+                } else if (d2 <= 34 * 34) {
                     r = ar; g = ag; b = ab;
                 } else {
-                    /* Subtle concentric vinyl grooves */
                     int rad = (int)sqrtf((float)d2);
-                    bool groove = ((rad % 4) == 0);
+                    bool groove = ((rad % 6) == 0);
                     r = groove ? 26 : 14;
                     g = groove ? 32 : 18;
                     b = groove ? 44 : 26;
-                    /* Glossy diagonal reflection */
-                    if ((dx * dy) > 0 && abs(dx - dy) < 18) {
+                    if ((dx * dy) > 0 && abs(dx - dy) < 30) {
                         r = (uint8_t)(r + 14);
                         g = (uint8_t)(g + 16);
                         b = (uint8_t)(b + 20);
                     }
                 }
             }
-            dst[y * ALBUM_ART_WIDTH + x] = rgb565_make(r, g, b);
+            dst[(size_t)y * ALBUM_ART_WIDTH + x] = rgb565_make(r, g, b);
         }
     }
 }
@@ -203,7 +229,7 @@ static esp_err_t http_get_to_buf(const char *url, uint8_t *buf, size_t cap, size
         .event_handler = http_event_cb,
         .user_data = &hb,
         .timeout_ms = 6000,
-        .buffer_size = 2048,
+        .buffer_size = 4096,
         .buffer_size_tx = 1024,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .user_agent = "ES3C28P-Radio/1.0",
@@ -259,25 +285,58 @@ static UINT tjpgd_out_func(JDEC *jd, void *bitmap, JRECT *rect)
     return 1;
 }
 
-static void resize_rgb565_bilinear_or_nn(const uint16_t *src, uint16_t sw, uint16_t sh,
-                                         uint16_t *dst, uint16_t dw, uint16_t dh)
+static void compose_widescreen_canvas(const uint16_t *src, uint16_t sw, uint16_t sh, uint16_t *dst)
 {
-    if (sw == dw && sh == dh) {
-        memcpy(dst, src, (size_t)dw * dh * sizeof(uint16_t));
-        return;
-    }
-    for (uint16_t y = 0; y < dh; y++) {
-        uint16_t sy = (uint16_t)(((uint32_t)y * sh) / dh);
+    for (int y = 0; y < ALBUM_ART_HEIGHT; y++) {
+        uint16_t sy = (uint16_t)(((uint32_t)y * sh) / ART_COVER_SIZE);
         if (sy >= sh) sy = sh - 1;
-        for (uint16_t x = 0; x < dw; x++) {
-            uint16_t sx = (uint16_t)(((uint32_t)x * sw) / dw);
-            if (sx >= sw) sx = sw - 1;
-            dst[(size_t)y * dw + x] = src[(size_t)sy * sw + sx];
+        uint16_t *row = dst + (size_t)y * ALBUM_ART_WIDTH;
+
+        if (sw == ART_COVER_SIZE && sh == ART_COVER_SIZE) {
+            memcpy(row + ART_WING_W, src + (size_t)y * sw, ART_COVER_SIZE * sizeof(uint16_t));
+        } else {
+            for (int x = 0; x < ART_COVER_SIZE; x++) {
+                uint16_t sx = (uint16_t)(((uint32_t)x * sw) / ART_COVER_SIZE);
+                if (sx >= sw) sx = sw - 1;
+                row[ART_WING_W + x] = src[(size_t)sy * sw + sx];
+            }
+        }
+    }
+
+    for (int y = 0; y < ALBUM_ART_HEIGHT; y++) {
+        if ((y & 0x3F) == 0x3F) taskYIELD();
+        uint32_t lr = 0, lg = 0, lb = 0;
+        uint32_t rr = 0, rg = 0, rb = 0;
+        int cnt = 0;
+        int y0 = y - 10; if (y0 < 0) y0 = 0;
+        int y1 = y + 10; if (y1 >= ALBUM_ART_HEIGHT) y1 = ALBUM_ART_HEIGHT - 1;
+        for (int yy = y0; yy <= y1; yy++) {
+            uint8_t r, g, b;
+            rgb565_split(dst[(size_t)yy * ALBUM_ART_WIDTH + ART_WING_W], &r, &g, &b);
+            lr += r; lg += g; lb += b;
+            rgb565_split(dst[(size_t)yy * ALBUM_ART_WIDTH + ART_WING_W + ART_COVER_SIZE - 1], &r, &g, &b);
+            rr += r; rg += g; rb += b;
+            cnt++;
+        }
+        lr /= (uint32_t)cnt; lg /= (uint32_t)cnt; lb /= (uint32_t)cnt;
+        rr /= (uint32_t)cnt; rg /= (uint32_t)cnt; rb /= (uint32_t)cnt;
+
+        uint16_t *row = dst + (size_t)y * ALBUM_ART_WIDTH;
+        for (int x = 0; x < ART_WING_W; x++) {
+            int lw = 20 + (x * 28) / ART_WING_W;
+            row[x] = rgb565_make((uint8_t)((lr * lw) / 100),
+                                 (uint8_t)((lg * lw) / 100),
+                                 (uint8_t)((lb * lw) / 100));
+
+            int rw = 48 - (x * 28) / ART_WING_W;
+            row[ART_WING_W + ART_COVER_SIZE + x] = rgb565_make((uint8_t)((rr * rw) / 100),
+                                                               (uint8_t)((rg * rw) / 100),
+                                                               (uint8_t)((rb * rw) / 100));
         }
     }
 }
 
-static bool decode_jpeg_to_rgb565(const uint8_t *jpeg_data, size_t jpeg_size, uint16_t *dst_128x128)
+static bool decode_jpeg_to_rgb565(const uint8_t *jpeg_data, size_t jpeg_size, uint16_t *dst_canvas)
 {
     if (!jpeg_data || jpeg_size < 4 || jpeg_data[0] != 0xFF || jpeg_data[1] != 0xD8) {
         return false;
@@ -304,8 +363,8 @@ static bool decode_jpeg_to_rgb565(const uint8_t *jpeg_data, size_t jpeg_size, ui
     }
 
     BYTE scale = 0;
-    while (scale < 3 && ((jdec.width >> (scale + 1)) >= ALBUM_ART_WIDTH) &&
-           ((jdec.height >> (scale + 1)) >= ALBUM_ART_HEIGHT)) {
+    while (scale < 3 && ((jdec.width >> (scale + 1)) >= ART_COVER_SIZE) &&
+           ((jdec.height >> (scale + 1)) >= ART_COVER_SIZE)) {
         scale++;
     }
 
@@ -325,8 +384,7 @@ static bool decode_jpeg_to_rgb565(const uint8_t *jpeg_data, size_t jpeg_size, ui
 
     res = jd_decomp(&jdec, tjpgd_out_func, scale);
     if (res == JDR_OK) {
-        resize_rgb565_bilinear_or_nn(decoded, ctx.out_w, ctx.out_h,
-                                     dst_128x128, ALBUM_ART_WIDTH, ALBUM_ART_HEIGHT);
+        compose_widescreen_canvas(decoded, ctx.out_w, ctx.out_h, dst_canvas);
         ESP_LOGI(TAG, "Decoded JPEG %ux%u (scale=%u -> %ux%u)",
                  jdec.width, jdec.height, scale, ctx.out_w, ctx.out_h);
     } else {
@@ -379,7 +437,7 @@ static bool fetch_itunes_art_url(const char *artist, const char *track, char *ou
             snprintf(out_url, out_len, "%s", art->valuestring);
             char *dim = strstr(out_url, "100x100bb");
             if (dim) {
-                memcpy(dim, "128x128bb", 9);
+                memcpy(dim, "240x240bb", 9);
             }
             found = true;
         }
@@ -388,89 +446,103 @@ static bool fetch_itunes_art_url(const char *artist, const char *track, char *ou
     return found;
 }
 
+static int pick_victim_slot_locked(void)
+{
+    int victim = -1;
+    uint32_t oldest_id = UINT32_MAX;
+
+    for (int i = 0; i < ART_CACHE_SLOTS; i++) {
+        if (i == s_active_slot) continue;
+        if (!s_slots[i].in_use) {
+            return i;
+        }
+        if (s_slots[i].art_id < oldest_id) {
+            oldest_id = s_slots[i].art_id;
+            victim = i;
+        }
+    }
+    return (victim >= 0) ? victim : ((s_active_slot + 1) % ART_CACHE_SLOTS);
+}
+
+static void publish_scratch_to_slot_locked(const art_job_t *job, bool is_cover)
+{
+    int slot = pick_victim_slot_locked();
+
+    uint16_t *tmp = s_slots[slot].pixels;
+    s_slots[slot].pixels = s_scratch_pixels;
+    s_scratch_pixels = tmp;
+
+    s_slots[slot].art_id = job->art_id;
+    s_slots[slot].station_index = job->station_index;
+    snprintf(s_slots[slot].artist, sizeof(s_slots[slot].artist), "%s", job->artist);
+    snprintf(s_slots[slot].track, sizeof(s_slots[slot].track), "%s", job->track);
+    s_slots[slot].in_use = true;
+    s_slots[slot].ready = true;
+    s_slots[slot].is_cover = is_cover;
+
+    /* If playback has already committed this art_id (or this is the active track), display now */
+    if (job->art_id == s_committed_art_id) {
+        s_active_slot = slot;
+        s_art_version++;
+        ESP_LOGI(TAG, "Artwork active now (id=%lu): '%s - %s'",
+                 (unsigned long)job->art_id, job->artist, job->track);
+    } else {
+        ESP_LOGI(TAG, "Artwork pre-decoded & staged (id=%lu, cover=%d): '%s - %s'",
+                 (unsigned long)job->art_id, is_cover ? 1 : 0, job->artist, job->track);
+    }
+}
+
 static void art_task(void *arg)
 {
     (void)arg;
-    uint32_t last_processed_gen = 0;
 
     while (1) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
 
-        xSemaphoreTake(s_art_mutex, portMAX_DELAY);
-        uint32_t gen = s_req_gen;
-        int st_idx = s_req_station;
-        char artist[96];
-        char track[128];
-        snprintf(artist, sizeof(artist), "%s", s_req_artist);
-        snprintf(track, sizeof(track), "%s", s_req_track);
-        xSemaphoreGive(s_art_mutex);
+        while (1) {
+            art_job_t job;
+            uint32_t clear_gen_snap;
 
-        if (gen == 0 || gen == last_processed_gen) {
-            continue;
-        }
-
-        if (is_non_song_metadata(artist, track)) {
-            render_fallback_art(s_scratch_pixels, st_idx);
             xSemaphoreTake(s_art_mutex, portMAX_DELAY);
-            if (gen == s_req_gen) {
-                memcpy(s_active_pixels, s_scratch_pixels, ALBUM_ART_BYTES);
-                s_active_is_cover = false;
-                s_art_version++;
+            if (s_job_count == 0) {
+                xSemaphoreGive(s_art_mutex);
+                break;
             }
+            job = s_job_q[s_job_head];
+            s_job_head = (s_job_head + 1) % ART_JOB_QUEUE_LEN;
+            s_job_count--;
+            clear_gen_snap = s_clear_gen;
             xSemaphoreGive(s_art_mutex);
-            last_processed_gen = gen;
-            continue;
-        }
 
-        /* Wait until STA Wi-Fi is connected */
-        wifi_mgr_status_t wst;
-        wifi_manager_get_status(&wst);
-        if (wst.state != WIFI_MGR_CONNECTED_STA) {
-            continue;
-        }
+            bool ok = false;
+            if (!is_non_song_metadata(job.artist, job.track)) {
+                wifi_mgr_status_t wst;
+                wifi_manager_get_status(&wst);
+                if (wst.state == WIFI_MGR_CONNECTED_STA) {
+                    char img_url[256] = {0};
+                    if (fetch_itunes_art_url(job.artist, job.track, img_url, sizeof(img_url))) {
+                        uint8_t *img_buf = art_alloc(ART_HTTP_MAX_IMG_BYTES);
+                        if (img_buf) {
+                            size_t img_len = 0;
+                            if (http_get_to_buf(img_url, img_buf, ART_HTTP_MAX_IMG_BYTES, &img_len) == ESP_OK) {
+                                ok = decode_jpeg_to_rgb565(img_buf, img_len, s_scratch_pixels);
+                            }
+                            free(img_buf);
+                        }
+                    } else {
+                        ESP_LOGI(TAG, "No iTunes artwork for '%s - %s'", job.artist, job.track);
+                    }
+                }
+            }
 
-        /* Show station fallback immediately while fetching new cover */
-        render_fallback_art(s_scratch_pixels, st_idx);
-        xSemaphoreTake(s_art_mutex, portMAX_DELAY);
-        if (gen == s_req_gen) {
-            memcpy(s_active_pixels, s_scratch_pixels, ALBUM_ART_BYTES);
-            s_active_is_cover = false;
-            s_art_version++;
-        }
-        xSemaphoreGive(s_art_mutex);
+            if (!ok) {
+                render_fallback_art(s_scratch_pixels, job.station_index);
+            }
 
-        last_processed_gen = gen;
-
-        char img_url[256] = {0};
-        if (!fetch_itunes_art_url(artist, track, img_url, sizeof(img_url))) {
-            ESP_LOGI(TAG, "No iTunes artwork for '%s - %s'", artist, track);
-            continue;
-        }
-
-        /* Abort stale fetch if track changed already */
-        xSemaphoreTake(s_art_mutex, portMAX_DELAY);
-        bool stale = (gen != s_req_gen);
-        xSemaphoreGive(s_art_mutex);
-        if (stale) continue;
-
-        uint8_t *img_buf = art_alloc(ART_HTTP_MAX_IMG_BYTES);
-        if (!img_buf) continue;
-
-        size_t img_len = 0;
-        esp_err_t dl_err = http_get_to_buf(img_url, img_buf, ART_HTTP_MAX_IMG_BYTES, &img_len);
-        bool ok = false;
-        if (dl_err == ESP_OK) {
-            ok = decode_jpeg_to_rgb565(img_buf, img_len, s_scratch_pixels);
-        }
-        free(img_buf);
-
-        if (ok) {
             xSemaphoreTake(s_art_mutex, portMAX_DELAY);
-            if (gen == s_req_gen) {
-                memcpy(s_active_pixels, s_scratch_pixels, ALBUM_ART_BYTES);
-                s_active_is_cover = true;
-                s_art_version++;
-                ESP_LOGI(TAG, "Artwork updated for '%s - %s'", artist, track);
+            /* Discard only if cleared/station-changed while downloading */
+            if (clear_gen_snap == s_clear_gen) {
+                publish_scratch_to_slot_locked(&job, ok);
             }
             xSemaphoreGive(s_art_mutex);
         }
@@ -480,46 +552,153 @@ static void art_task(void *arg)
 esp_err_t album_art_init(void)
 {
     s_art_mutex = xSemaphoreCreateMutex();
-    s_active_pixels = art_alloc(ALBUM_ART_BYTES);
     s_scratch_pixels = art_alloc(ALBUM_ART_BYTES);
-    if (!s_art_mutex || !s_active_pixels || !s_scratch_pixels) {
+    if (!s_art_mutex || !s_scratch_pixels) {
         return ESP_ERR_NO_MEM;
     }
 
-    render_fallback_art(s_active_pixels, 0);
-    s_active_is_cover = false;
+    for (int i = 0; i < ART_CACHE_SLOTS; i++) {
+        memset(&s_slots[i], 0, sizeof(s_slots[i]));
+        s_slots[i].pixels = art_alloc(ALBUM_ART_BYTES);
+        if (!s_slots[i].pixels) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    render_fallback_art(s_slots[0].pixels, 0);
+    s_slots[0].in_use = true;
+    s_slots[0].ready = true;
+    s_slots[0].is_cover = false;
+    s_active_slot = 0;
     s_art_version = 1;
 
-    xTaskCreatePinnedToCore(art_task, "album_art", 8192, NULL, 3, &s_art_task, 0);
+    xTaskCreatePinnedToCore(art_task, "album_art", 8192, NULL, 2, &s_art_task, 0);
     return ESP_OK;
 }
 
-void album_art_request(int station_index, const char *artist, const char *track)
+uint32_t album_art_prepare(int station_index, const char *artist, const char *track)
 {
-    if (!s_art_mutex) return;
+    if (!s_art_mutex) return 0;
     const char *a = artist ? artist : "";
     const char *t = track ? track : "";
 
     xSemaphoreTake(s_art_mutex, portMAX_DELAY);
-    bool same = (s_req_station == station_index &&
-                 strcmp(s_req_artist, a) == 0 &&
-                 strcmp(s_req_track, t) == 0);
-    if (!same) {
-        s_req_station = station_index;
-        snprintf(s_req_artist, sizeof(s_req_artist), "%s", a);
-        snprintf(s_req_track, sizeof(s_req_track), "%s", t);
-        s_req_gen++;
+
+    /* Reuse already-cached slot for exact same song + station */
+    for (int i = 0; i < ART_CACHE_SLOTS; i++) {
+        if (s_slots[i].in_use && s_slots[i].art_id > 0 &&
+            s_slots[i].station_index == station_index &&
+            strcmp(s_slots[i].artist, a) == 0 &&
+            strcmp(s_slots[i].track, t) == 0) {
+            uint32_t id = s_slots[i].art_id;
+            xSemaphoreGive(s_art_mutex);
+            return id;
+        }
     }
+
+    /* Check if identical job is already queued */
+    for (int k = 0; k < s_job_count; k++) {
+        int idx = (s_job_head + k) % ART_JOB_QUEUE_LEN;
+        if (s_job_q[idx].station_index == station_index &&
+            strcmp(s_job_q[idx].artist, a) == 0 &&
+            strcmp(s_job_q[idx].track, t) == 0) {
+            uint32_t id = s_job_q[idx].art_id;
+            xSemaphoreGive(s_art_mutex);
+            return id;
+        }
+    }
+
+    uint32_t id = s_next_art_id++;
+    if (s_next_art_id == 0) s_next_art_id = 1;
+
+    if (s_job_count >= ART_JOB_QUEUE_LEN) {
+        /* Drop oldest unstarted job */
+        s_job_head = (s_job_head + 1) % ART_JOB_QUEUE_LEN;
+        s_job_count--;
+    }
+
+    art_job_t *j = &s_job_q[s_job_tail];
+    j->art_id = id;
+    j->station_index = station_index;
+    snprintf(j->artist, sizeof(j->artist), "%s", a);
+    snprintf(j->track, sizeof(j->track), "%s", t);
+    s_job_tail = (s_job_tail + 1) % ART_JOB_QUEUE_LEN;
+    s_job_count++;
+
     xSemaphoreGive(s_art_mutex);
 
-    if (!same && s_art_task) {
+    if (s_art_task) {
         xTaskNotifyGive(s_art_task);
     }
+    return id;
+}
+
+void album_art_commit(uint32_t art_id, int station_index)
+{
+    if (!s_art_mutex || art_id == 0) return;
+
+    xSemaphoreTake(s_art_mutex, portMAX_DELAY);
+    s_committed_art_id = art_id;
+
+    int found = -1;
+    for (int i = 0; i < ART_CACHE_SLOTS; i++) {
+        if (s_slots[i].in_use && s_slots[i].art_id == art_id && s_slots[i].ready) {
+            found = i;
+            break;
+        }
+    }
+
+    if (found >= 0) {
+        if (s_active_slot != found) {
+            s_active_slot = found;
+            s_art_version++;
+            ESP_LOGI(TAG, "Committed staged artwork id=%lu immediately", (unsigned long)art_id);
+        }
+    } else if (s_slots[s_active_slot].station_index != station_index) {
+        /* Different station and cover isn't ready yet -> show station fallback until ready */
+        int fb = pick_victim_slot_locked();
+        render_fallback_art(s_slots[fb].pixels, station_index);
+        s_slots[fb].in_use = true;
+        s_slots[fb].ready = true;
+        s_slots[fb].is_cover = false;
+        s_slots[fb].art_id = 0;
+        s_slots[fb].station_index = station_index;
+        s_slots[fb].artist[0] = '\0';
+        s_slots[fb].track[0] = '\0';
+        s_active_slot = fb;
+        s_art_version++;
+    }
+    xSemaphoreGive(s_art_mutex);
 }
 
 void album_art_clear(int station_index)
 {
-    album_art_request(station_index, "", "");
+    if (!s_art_mutex) return;
+
+    xSemaphoreTake(s_art_mutex, portMAX_DELAY);
+    s_clear_gen++;
+    s_committed_art_id = 0;
+    s_job_head = 0;
+    s_job_tail = 0;
+    s_job_count = 0;
+
+    for (int i = 0; i < ART_CACHE_SLOTS; i++) {
+        s_slots[i].in_use = false;
+        s_slots[i].ready = false;
+        s_slots[i].art_id = 0;
+    }
+
+    int slot = 0;
+    render_fallback_art(s_slots[slot].pixels, station_index);
+    s_slots[slot].in_use = true;
+    s_slots[slot].ready = true;
+    s_slots[slot].is_cover = false;
+    s_slots[slot].station_index = station_index;
+    s_slots[slot].artist[0] = '\0';
+    s_slots[slot].track[0] = '\0';
+    s_active_slot = slot;
+    s_art_version++;
+    xSemaphoreGive(s_art_mutex);
 }
 
 uint32_t album_art_get_version(void)
@@ -535,8 +714,8 @@ bool album_art_copy_rgb565(uint16_t *dst_pixels, size_t dst_bytes, bool *out_is_
 {
     if (!s_art_mutex || !dst_pixels || dst_bytes < ALBUM_ART_BYTES) return false;
     xSemaphoreTake(s_art_mutex, portMAX_DELAY);
-    memcpy(dst_pixels, s_active_pixels, ALBUM_ART_BYTES);
-    if (out_is_cover) *out_is_cover = s_active_is_cover;
+    memcpy(dst_pixels, s_slots[s_active_slot].pixels, ALBUM_ART_BYTES);
+    if (out_is_cover) *out_is_cover = s_slots[s_active_slot].is_cover;
     if (out_version) *out_version = s_art_version;
     xSemaphoreGive(s_art_mutex);
     return true;

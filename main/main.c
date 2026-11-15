@@ -3,6 +3,7 @@
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 
@@ -73,13 +74,15 @@ void app_main(void)
 
     i2c_master_bus_handle_t i2c_bus = init_shared_i2c();
 
-    ESP_ERROR_CHECK(audio_player_init(i2c_bus));
     ESP_ERROR_CHECK(album_art_init());
+    ESP_ERROR_CHECK(audio_player_init(i2c_bus));
     ESP_ERROR_CHECK(display_ui_init(i2c_bus));
     ESP_ERROR_CHECK(wifi_manager_init());
     ESP_ERROR_CHECK(web_server_start());
 
     xTaskCreate(boot_button_task, "boot_btn", 4096, NULL, 2, NULL);
 
-    ESP_LOGI(TAG, "Initialization complete.");
+    ESP_LOGI(TAG, "Initialization complete (free internal=%u, spiram=%u).",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 }

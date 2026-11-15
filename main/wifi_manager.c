@@ -315,6 +315,10 @@ esp_err_t wifi_manager_init(void)
 void wifi_manager_get_status(wifi_mgr_status_t *out_status)
 {
     if (!out_status) return;
+    if (!s_status_mutex) {
+        memset(out_status, 0, sizeof(wifi_mgr_status_t));
+        return;
+    }
     xSemaphoreTake(s_status_mutex, portMAX_DELAY);
     if (s_status.state == WIFI_MGR_CONNECTED_STA) {
         wifi_ap_record_t ap_info = {0};

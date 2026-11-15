@@ -32,6 +32,10 @@ static const char *TAG = "display_ui";
 #define BL_LEDC_CHANNEL     LEDC_CHANNEL_0
 #define BL_LEDC_DUTY_RES    LEDC_TIMER_10_BIT
 
+#define STATION_BANNER_US   2000000LL
+#define VOLUME_OSD_US       1400000LL
+#define SLEEP_WAKE_GUARD_US 350000LL
+
 static esp_lcd_panel_io_handle_t s_lcd_io = NULL;
 static esp_lcd_panel_handle_t s_lcd_panel = NULL;
 static esp_lcd_touch_handle_t s_touch_handle = NULL;
@@ -40,11 +44,14 @@ static lv_display_t *s_lvgl_disp = NULL;
 /* UI views */
 typedef enum {
     VIEW_PLAYER = 0,
-    VIEW_STATIONS,
-    VIEW_NETWORK,
+    VIEW_STOPPED,
+    VIEW_SLEEP,
 } ui_view_t;
 
-static ui_view_t s_cur_view = VIEW_PLAYER;
+typedef enum {
+    STOP_TAB_STATIONS = 0,
+    STOP_TAB_SETTINGS,
+} stopped_tab_t;
 
 typedef enum {
     GEST_NONE = 0,
@@ -52,23 +59,36 @@ typedef enum {
     GEST_SWIPE_X,
 } gesture_mode_t;
 
-/* LVGL widgets */
+/* 8-direction outlined label for legible overlay text on bright artwork */
+#define OUTLINE_OFFSETS 8
+typedef struct {
+    lv_obj_t *wrap;
+    lv_obj_t *bg[OUTLINE_OFFSETS];
+    lv_obj_t *fg;
+} outlined_label_t;
+
+static ui_view_t s_cur_view = VIEW_PLAYER;
+static stopped_tab_t s_stop_tab = STOP_TAB_STATIONS;
+
+/* Top-level screens/panels */
 static lv_obj_t *s_scr_main = NULL;
-
 static lv_obj_t *s_panel_player = NULL;
-static lv_obj_t *s_panel_stations = NULL;
-static lv_obj_t *s_panel_network = NULL;
+static lv_obj_t *s_panel_stopped = NULL;
+static lv_obj_t *s_panel_sleep = NULL;
 
-/* Player widgets */
-static lv_obj_t *s_lbl_station = NULL;
-static lv_obj_t *s_lbl_state_pill = NULL;
+/* Player widgets (zero buttons, maximized art) */
 static lv_obj_t *s_img_art = NULL;
-static lv_obj_t *s_lbl_track = NULL;
-static lv_obj_t *s_lbl_artist = NULL;
-static lv_obj_t *s_lbl_codec_info = NULL;
-static lv_obj_t *s_bar_buf = NULL;
+static outlined_label_t s_ol_track;
+static outlined_label_t s_ol_artist;
+static lv_grad_dsc_t s_scrim_grad;
 
-/* Floating Gesture OSD */
+/* Temporary 2-second station banner overlay */
+static lv_obj_t *s_station_banner = NULL;
+static lv_obj_t *s_lbl_station_banner = NULL;
+static int64_t s_station_hide_us = 0;
+static int s_last_station_idx = -1;
+
+/* Temporary gesture volume OSD overlay */
 static lv_obj_t *s_osd_box = NULL;
 static lv_obj_t *s_osd_lbl = NULL;
 static lv_obj_t *s_osd_bar = NULL;
@@ -79,11 +99,14 @@ static uint16_t *s_art_pixels = NULL;
 static lv_image_dsc_t s_art_dsc;
 static uint32_t s_shown_art_ver = 0;
 
-/* Stations list container */
+/* Unified Stopped screen widgets */
+static lv_obj_t *s_btn_tab_stations = NULL;
+static lv_obj_t *s_btn_tab_settings = NULL;
+static lv_obj_t *s_tab_stations = NULL;
+static lv_obj_t *s_tab_settings = NULL;
 static lv_obj_t *s_list_stations = NULL;
 static volatile bool s_need_station_rebuild = false;
 
-/* Network / Settings view labels */
 static lv_obj_t *s_lbl_net_mode = NULL;
 static lv_obj_t *s_lbl_net_detail = NULL;
 static lv_obj_t *s_lbl_net_hint = NULL;
@@ -94,7 +117,18 @@ static lv_point_t s_gest_start = {0, 0};
 static lv_point_t s_gest_last = {0, 0};
 static int s_gest_start_vol = 0;
 static int s_gest_max_dist = 0;
-static bool s_gest_long_pressed = false;
+
+/* Sleep state */
+static int64_t s_sleep_entered_us = 0;
+static bool s_sleep_touch_armed = false;
+
+static void set_backlight_raw(uint8_t pct)
+{
+    if (pct > 100) pct = 100;
+    uint32_t duty = ((uint32_t)pct * 1023U) / 100U;
+    ledc_set_duty(BL_LEDC_MODE, BL_LEDC_CHANNEL, duty);
+    ledc_update_duty(BL_LEDC_MODE, BL_LEDC_CHANNEL);
+}
 
 static void backlight_init(uint8_t initial_pct)
 {
@@ -124,9 +158,7 @@ void display_ui_set_brightness(uint8_t pct)
 {
     if (pct < 10) pct = 10;
     if (pct > 100) pct = 100;
-    uint32_t duty = ((uint32_t)pct * 1023) / 100;
-    ledc_set_duty(BL_LEDC_MODE, BL_LEDC_CHANNEL, duty);
-    ledc_update_duty(BL_LEDC_MODE, BL_LEDC_CHANNEL);
+    set_backlight_raw(pct);
 }
 
 static void apply_orientation_and_color(bool invert_color, bool flip_180, bool swap_rb)
@@ -142,7 +174,6 @@ static void apply_orientation_and_color(bool invert_color, bool flip_180, bool s
     esp_lcd_touch_set_mirror_x(s_touch_handle, false);
     esp_lcd_touch_set_mirror_y(s_touch_handle, false);
 
-    /* Update BGR/RGB bit in MADCTL (reg 0x36) via raw panel io if needed */
     uint8_t madctl = flip_180 ? 0xE0 : 0x20;
     if (!swap_rb) {
         madctl |= 0x08; /* BGR bit */
@@ -154,7 +185,9 @@ void display_ui_apply_settings(void)
 {
     app_config_meta_t cfg;
     app_config_get_meta(&cfg);
-    display_ui_set_brightness(cfg.brightness);
+    if (s_cur_view != VIEW_SLEEP) {
+        display_ui_set_brightness(cfg.brightness);
+    }
 
     if (lvgl_port_lock(500)) {
         apply_orientation_and_color(cfg.invert_color, cfg.flip_180, cfg.swap_rb);
@@ -163,57 +196,189 @@ void display_ui_apply_settings(void)
     }
 }
 
+/* ---------- Outlined Label Helpers ---------- */
+static void outlined_label_create(lv_obj_t *parent, outlined_label_t *ol, int32_t w,
+                                  const lv_font_t *font, lv_color_t fg_color, lv_text_align_t align)
+{
+    static const int8_t dx[OUTLINE_OFFSETS] = { -1,  0,  1, -1, 1, -1, 0, 1 };
+    static const int8_t dy[OUTLINE_OFFSETS] = { -1, -1, -1,  0, 0,  1, 1, 1 };
+
+    ol->wrap = lv_obj_create(parent);
+    lv_obj_set_size(ol->wrap, w + 4, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(ol->wrap, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ol->wrap, 0, 0);
+    lv_obj_set_style_pad_all(ol->wrap, 2, 0);
+    lv_obj_set_scrollable(ol->wrap, false);
+    lv_obj_set_clickable(ol->wrap, false);
+
+    for (int i = 0; i < OUTLINE_OFFSETS; i++) {
+        lv_obj_t *lbl = lv_label_create(ol->wrap);
+        lv_label_set_text(lbl, "");
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(lbl, w);
+        lv_obj_set_style_text_align(lbl, align, 0);
+        lv_obj_set_style_text_font(lbl, font, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0x000000), 0);
+        lv_obj_align(lbl, LV_ALIGN_TOP_MID, dx[i], dy[i]);
+        ol->bg[i] = lbl;
+    }
+
+    ol->fg = lv_label_create(ol->wrap);
+    lv_label_set_text(ol->fg, "");
+    lv_label_set_long_mode(ol->fg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(ol->fg, w);
+    lv_obj_set_style_text_align(ol->fg, align, 0);
+    lv_obj_set_style_text_font(ol->fg, font, 0);
+    lv_obj_set_style_text_color(ol->fg, fg_color, 0);
+    lv_obj_align(ol->fg, LV_ALIGN_TOP_MID, 0, 0);
+}
+
+static void outlined_label_set_text(outlined_label_t *ol, const char *txt)
+{
+    if (!ol->fg) return;
+    const char *s = txt ? txt : "";
+    if (strcmp(lv_label_get_text(ol->fg), s) == 0) return;
+
+    for (int i = 0; i < OUTLINE_OFFSETS; i++) {
+        lv_label_set_text(ol->bg[i], s);
+    }
+    lv_label_set_text(ol->fg, s);
+}
+
+static void outlined_label_set_font(outlined_label_t *ol, const lv_font_t *font)
+{
+    if (!ol->fg) return;
+    if (lv_obj_get_style_text_font(ol->fg, 0) == font) return;
+
+    for (int i = 0; i < OUTLINE_OFFSETS; i++) {
+        lv_obj_set_style_text_font(ol->bg[i], font, 0);
+    }
+    lv_obj_set_style_text_font(ol->fg, font, 0);
+}
+
+static void outlined_label_set_color(outlined_label_t *ol, lv_color_t color)
+{
+    if (!ol->fg) return;
+    lv_obj_set_style_text_color(ol->fg, color, 0);
+}
+
+static void outlined_label_set_hidden(outlined_label_t *ol, bool hidden)
+{
+    if (!ol->wrap) return;
+    lv_obj_set_hidden(ol->wrap, hidden);
+}
+
+/* ---------- View & Tab Switching ---------- */
+static void switch_stopped_tab(stopped_tab_t tab)
+{
+    s_stop_tab = tab;
+    bool st_active = (tab == STOP_TAB_STATIONS);
+    lv_obj_set_hidden(s_tab_stations, !st_active);
+    lv_obj_set_hidden(s_tab_settings, st_active);
+    lv_obj_set_style_bg_color(s_btn_tab_stations,
+                              lv_color_hex(st_active ? 0x0369A1 : 0x1E293B), 0);
+    lv_obj_set_style_bg_color(s_btn_tab_settings,
+                              lv_color_hex(!st_active ? 0x0369A1 : 0x1E293B), 0);
+    if (st_active) {
+        s_need_station_rebuild = true;
+    }
+}
+
 static void switch_view(ui_view_t view)
 {
     s_cur_view = view;
-    if (view == VIEW_PLAYER) {
-        lv_obj_clear_flag(s_panel_player, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_panel_stations, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_panel_network, LV_OBJ_FLAG_HIDDEN);
-    } else if (view == VIEW_STATIONS) {
-        lv_obj_add_flag(s_panel_player, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(s_panel_stations, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_panel_network, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_hidden(s_panel_player, view != VIEW_PLAYER);
+    lv_obj_set_hidden(s_panel_stopped, view != VIEW_STOPPED);
+    lv_obj_set_hidden(s_panel_sleep, view != VIEW_SLEEP);
+
+    if (view == VIEW_STOPPED) {
+        wifi_mgr_status_t wst;
+        wifi_manager_get_status(&wst);
+        if (wst.state == WIFI_MGR_AP_CONFIG_MODE) {
+            switch_stopped_tab(STOP_TAB_SETTINGS);
+        } else {
+            switch_stopped_tab(s_stop_tab);
+        }
         s_need_station_rebuild = true;
-    } else {
-        lv_obj_add_flag(s_panel_player, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_panel_stations, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(s_panel_network, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
-static void show_osd_toast(const char *text, bool show_vol_bar, int vol_pct)
+static void show_station_banner(int station_idx, const char *station_name)
+{
+    if (!s_station_banner || !s_lbl_station_banner) return;
+    char buf[80];
+    snprintf(buf, sizeof(buf), "%d. %s", station_idx + 1,
+             (station_name && station_name[0]) ? station_name : "Station");
+    lv_label_set_text(s_lbl_station_banner, buf);
+    lv_obj_set_hidden(s_station_banner, false);
+    s_station_hide_us = esp_timer_get_time() + STATION_BANNER_US;
+    s_last_station_idx = station_idx;
+}
+
+static void show_station_banner_current(void)
+{
+    player_status_t pst;
+    audio_player_get_status(&pst);
+    show_station_banner(pst.station_index, pst.station_name);
+}
+
+static void show_vol_osd(int vol_pct)
 {
     if (!s_osd_box) return;
-    lv_label_set_text(s_osd_lbl, text);
-    if (show_vol_bar) {
-        lv_obj_clear_flag(s_osd_bar, LV_OBJ_FLAG_HIDDEN);
-        lv_bar_set_value(s_osd_bar, vol_pct, LV_ANIM_OFF);
-    } else {
-        lv_obj_add_flag(s_osd_bar, LV_OBJ_FLAG_HIDDEN);
+    char buf[24];
+    snprintf(buf, sizeof(buf), LV_SYMBOL_VOLUME_MAX "  %d%%", vol_pct);
+    lv_label_set_text(s_osd_lbl, buf);
+    lv_bar_set_value(s_osd_bar, vol_pct, LV_ANIM_OFF);
+    lv_obj_set_hidden(s_osd_box, false);
+    s_osd_hide_us = esp_timer_get_time() + VOLUME_OSD_US;
+}
+
+/* ---------- Sleep & Wake ---------- */
+static void enter_sleep_mode(void)
+{
+    audio_player_stop();
+    s_sleep_entered_us = esp_timer_get_time();
+    s_sleep_touch_armed = false;
+    switch_view(VIEW_SLEEP);
+
+    set_backlight_raw(0);
+    if (s_lcd_panel) {
+        esp_lcd_panel_disp_on_off(s_lcd_panel, false);
     }
-    lv_obj_clear_flag(s_osd_box, LV_OBJ_FLAG_HIDDEN);
-    s_osd_hide_us = esp_timer_get_time() + 1400000LL;
+    ESP_LOGI(TAG, "Entered sleep mode");
 }
 
-static void on_back_to_player_clicked(lv_event_t *e)
+static void wake_from_sleep(ui_view_t target_view)
 {
-    (void)e;
-    switch_view(VIEW_PLAYER);
+    app_config_meta_t cfg;
+    app_config_get_meta(&cfg);
+
+    if (s_lcd_panel) {
+        esp_lcd_panel_disp_on_off(s_lcd_panel, true);
+    }
+    display_ui_set_brightness(cfg.brightness);
+    s_sleep_touch_armed = false;
+    switch_view(target_view);
+    ESP_LOGI(TAG, "Woke from sleep mode");
 }
 
-static void on_nav_stations_clicked(lv_event_t *e)
+static void on_sleep_screen_event(lv_event_t *e)
 {
-    (void)e;
-    switch_view(VIEW_STATIONS);
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_PRESSED) {
+        if ((esp_timer_get_time() - s_sleep_entered_us) >= SLEEP_WAKE_GUARD_US) {
+            s_sleep_touch_armed = true;
+        }
+    } else if (code == LV_EVENT_RELEASED) {
+        if (s_sleep_touch_armed) {
+            wake_from_sleep(VIEW_STOPPED);
+        }
+    } else if (code == LV_EVENT_PRESS_LOST) {
+        s_sleep_touch_armed = false;
+    }
 }
 
-static void on_nav_net_clicked(lv_event_t *e)
-{
-    (void)e;
-    switch_view(VIEW_NETWORK);
-}
-
+/* ---------- Player Gesture Events ---------- */
 static void on_player_gesture_event(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
@@ -229,7 +394,6 @@ static void on_player_gesture_event(lv_event_t *e)
         s_gest_start_vol = (int)audio_player_get_volume();
         s_gest_mode = GEST_NONE;
         s_gest_max_dist = 0;
-        s_gest_long_pressed = false;
     } else if (code == LV_EVENT_PRESSING) {
         s_gest_last = pt;
         int dx = (int)pt.x - (int)s_gest_start.x;
@@ -246,19 +410,11 @@ static void on_player_gesture_event(lv_event_t *e)
         }
 
         if (s_gest_mode == GEST_VOLUME) {
-            /* Swipe up (dy < 0) increases volume; ~150px maps 100% range */
             int target = s_gest_start_vol + (-dy * 100) / 150;
             if (target < 0) target = 0;
             if (target > 100) target = 100;
             audio_player_set_volume_live((uint8_t)target, false);
-            char buf[24];
-            snprintf(buf, sizeof(buf), LV_SYMBOL_VOLUME_MAX "  %d%%", target);
-            show_osd_toast(buf, true, target);
-        }
-    } else if (code == LV_EVENT_LONG_PRESSED) {
-        if (s_gest_mode == GEST_NONE && s_gest_max_dist < 14) {
-            s_gest_long_pressed = true;
-            switch_view(VIEW_STATIONS);
+            show_vol_osd(target);
         }
     } else if (code == LV_EVENT_RELEASED) {
         s_gest_last = pt;
@@ -267,23 +423,19 @@ static void on_player_gesture_event(lv_event_t *e)
         if (s_gest_mode == GEST_VOLUME) {
             uint8_t cur_vol = audio_player_get_volume();
             audio_player_set_volume_live(cur_vol, true);
-            char buf[24];
-            snprintf(buf, sizeof(buf), LV_SYMBOL_VOLUME_MAX "  %d%%", (int)cur_vol);
-            show_osd_toast(buf, true, (int)cur_vol);
+            show_vol_osd((int)cur_vol);
         } else if (s_gest_mode == GEST_SWIPE_X) {
             if (dx <= -35) {
                 audio_player_next();
-                show_osd_toast(LV_SYMBOL_NEXT "  Next Station", false, 0);
+                show_station_banner_current();
             } else if (dx >= 35) {
                 audio_player_prev();
-                show_osd_toast(LV_SYMBOL_PREV "  Prev Station", false, 0);
+                show_station_banner_current();
             }
-        } else if (s_gest_mode == GEST_NONE && !s_gest_long_pressed && s_gest_max_dist < 16) {
-            player_status_t pst;
-            audio_player_get_status(&pst);
-            bool stopping = (pst.state != PLAYER_STATE_STOPPED);
-            audio_player_toggle_play_pause();
-            show_osd_toast(stopping ? LV_SYMBOL_STOP "  Stopped" : LV_SYMBOL_PLAY "  Playing", false, 0);
+        } else if (s_gest_mode == GEST_NONE && s_gest_max_dist < 16) {
+            /* Tap on Player screen -> Stop and open Unified Stopped screen */
+            audio_player_stop();
+            switch_view(VIEW_STOPPED);
         }
         s_gest_mode = GEST_NONE;
     } else if (code == LV_EVENT_PRESS_LOST) {
@@ -294,11 +446,41 @@ static void on_player_gesture_event(lv_event_t *e)
     }
 }
 
+/* ---------- Stopped Screen Button Handlers ---------- */
+static void on_play_resume_clicked(lv_event_t *e)
+{
+    (void)e;
+    app_config_meta_t cfg;
+    app_config_get_meta(&cfg);
+    audio_player_play_station(cfg.current_station);
+    switch_view(VIEW_PLAYER);
+    show_station_banner_current();
+}
+
+static void on_tab_stations_clicked(lv_event_t *e)
+{
+    (void)e;
+    switch_stopped_tab(STOP_TAB_STATIONS);
+}
+
+static void on_tab_settings_clicked(lv_event_t *e)
+{
+    (void)e;
+    switch_stopped_tab(STOP_TAB_SETTINGS);
+}
+
+static void on_sleep_clicked(lv_event_t *e)
+{
+    (void)e;
+    enter_sleep_mode();
+}
+
 static void on_station_item_clicked(lv_event_t *e)
 {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     audio_player_play_station(idx);
     switch_view(VIEW_PLAYER);
+    show_station_banner_current();
 }
 
 static void on_start_ap_clicked(lv_event_t *e)
@@ -323,12 +505,13 @@ static void rebuild_station_list(void)
 
         lv_obj_t *btn = lv_button_create(s_list_stations);
         lv_obj_set_width(btn, lv_pct(100));
-        lv_obj_set_height(btn, 40);
+        lv_obj_set_height(btn, 38);
         lv_obj_set_style_radius(btn, 8, 0);
         lv_obj_set_style_bg_color(btn, active ? lv_color_hex(0x0369A1) : lv_color_hex(0x1E293B), 0);
         lv_obj_set_style_border_width(btn, active ? 1 : 0, 0);
         lv_obj_set_style_border_color(btn, lv_color_hex(0x38BDF8), 0);
         lv_obj_set_style_pad_hor(btn, 10, 0);
+        lv_obj_set_style_shadow_width(btn, 0, 0);
         lv_obj_add_event_cb(btn, on_station_item_clicked, LV_EVENT_CLICKED, (void *)(intptr_t)i);
 
         lv_obj_t *lbl = lv_label_create(btn);
@@ -348,19 +531,20 @@ void display_ui_refresh_stations(void)
     s_need_station_rebuild = true;
 }
 
-static lv_obj_t *create_ctrl_btn(lv_obj_t *parent, const char *txt, int w, int h,
-                                 uint32_t bg_hex, lv_event_cb_t cb)
+static lv_obj_t *create_hdr_btn(lv_obj_t *parent, const char *txt, int w, int h,
+                                uint32_t bg_hex, lv_event_cb_t cb)
 {
     lv_obj_t *btn = lv_button_create(parent);
     lv_obj_set_size(btn, w, h);
-    lv_obj_set_style_radius(btn, 10, 0);
+    lv_obj_set_style_radius(btn, 7, 0);
     lv_obj_set_style_bg_color(btn, lv_color_hex(bg_hex), 0);
     lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_set_style_pad_all(btn, 0, 0);
     lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *lbl = lv_label_create(btn);
     lv_label_set_text(lbl, txt);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(lbl);
     return btn;
@@ -375,143 +559,109 @@ static void ui_timer_cb(lv_timer_t *timer)
         rebuild_station_list();
     }
 
-    if (s_osd_box && !lv_obj_has_flag(s_osd_box, LV_OBJ_FLAG_HIDDEN)) {
-        if (s_gest_mode != GEST_VOLUME && esp_timer_get_time() >= s_osd_hide_us) {
-            lv_obj_add_flag(s_osd_box, LV_OBJ_FLAG_HIDDEN);
-        }
-    }
-
     player_status_t pst;
     audio_player_get_status(&pst);
-    wifi_mgr_status_t wst;
-    wifi_manager_get_status(&wst);
-
-    /* Trigger background iTunes artwork fetch (deduplicated inside album_art) */
-    if (pst.state == PLAYER_STATE_STOPPED) {
-        album_art_clear(pst.station_index);
-    } else {
-        album_art_request(pst.station_index, pst.stream_artist, pst.stream_track);
+    wifi_mgr_status_t wst = {0};
+    static uint32_t s_wifi_poll_div = 0;
+    bool poll_wifi = false;
+    if (s_cur_view == VIEW_PLAYER) {
+        s_wifi_poll_div = 0;
+    } else if ((s_wifi_poll_div++ % 10U) == 0U) {
+        poll_wifi = true;
+        wifi_manager_get_status(&wst);
     }
 
-    /* Refresh artwork LVGL image buffer when version changes */
-    if (s_art_pixels && s_img_art) {
-        uint32_t cur_ver = album_art_get_version();
-        if (cur_ver != s_shown_art_ver) {
-            bool is_cover = false;
-            if (album_art_copy_rgb565(s_art_pixels, ALBUM_ART_BYTES, &is_cover, &s_shown_art_ver)) {
-                lv_image_cache_drop(&s_art_dsc);
-                lv_obj_invalidate(s_img_art);
+    /* Auto-sync view with playback state (e.g. Web UI Play/Stop or startup autoplay) */
+    static bool s_ap_tab_auto_shown = false;
+    if (poll_wifi && wst.state == WIFI_MGR_AP_CONFIG_MODE) {
+        if (!s_ap_tab_auto_shown && s_cur_view == VIEW_STOPPED) {
+            s_ap_tab_auto_shown = true;
+            switch_stopped_tab(STOP_TAB_SETTINGS);
+        }
+    } else if (poll_wifi) {
+        s_ap_tab_auto_shown = false;
+    }
+
+    if (s_cur_view == VIEW_SLEEP) {
+        if (pst.state != PLAYER_STATE_STOPPED) {
+            wake_from_sleep(VIEW_PLAYER);
+            show_station_banner(pst.station_index, pst.station_name);
+        } else {
+            return;
+        }
+    } else if (s_cur_view == VIEW_STOPPED && pst.state != PLAYER_STATE_STOPPED) {
+        switch_view(VIEW_PLAYER);
+        show_station_banner(pst.station_index, pst.station_name);
+    } else if (s_cur_view == VIEW_PLAYER && pst.state == PLAYER_STATE_STOPPED) {
+        switch_view(VIEW_STOPPED);
+    }
+
+    int64_t now_us = esp_timer_get_time();
+
+    /* Auto-hide temporary 2-second station banner */
+    if (s_station_banner && !lv_obj_is_hidden(s_station_banner)) {
+        if (now_us >= s_station_hide_us) {
+            lv_obj_set_hidden(s_station_banner, true);
+        }
+    }
+
+    /* Auto-hide temporary volume OSD */
+    if (s_osd_box && !lv_obj_is_hidden(s_osd_box)) {
+        if (s_gest_mode != GEST_VOLUME && now_us >= s_osd_hide_us) {
+            lv_obj_set_hidden(s_osd_box, true);
+        }
+    }
+
+    if (s_cur_view == VIEW_PLAYER) {
+        /* Detect station switches initiated externally (e.g. Web UI) */
+        if (pst.station_index != s_last_station_idx) {
+            show_station_banner(pst.station_index, pst.station_name);
+        }
+
+        /* Refresh maximized artwork image if version changed (driven in sync by audio_player) */
+        if (s_art_pixels && s_img_art) {
+            uint32_t cur_ver = album_art_get_version();
+            if (cur_ver != s_shown_art_ver) {
+                bool is_cover = false;
+                if (album_art_copy_rgb565(s_art_pixels, ALBUM_ART_BYTES, &is_cover, &s_shown_art_ver)) {
+                    lv_image_cache_drop(&s_art_dsc);
+                    lv_obj_invalidate(s_img_art);
+                }
             }
         }
-    }
 
-    /* Station name */
-    char st_hdr[80];
-    snprintf(st_hdr, sizeof(st_hdr), "%d. %s", pst.station_index + 1,
-             pst.station_name[0] ? pst.station_name : "No Station");
-    if (strcmp(lv_label_get_text(s_lbl_station), st_hdr) != 0) {
-        lv_label_set_text(s_lbl_station, st_hdr);
-    }
+        /* Minimalist track & artist display */
+        const char *track_txt = NULL;
+        const char *artist_txt = "";
+        const lv_font_t *track_font = &lv_font_montserrat_20;
 
-    /* Track title & Artist name */
-    const char *track_txt = NULL;
-    const char *artist_txt = "";
-    const lv_font_t *track_font = &lv_font_montserrat_20;
-    lv_color_t artist_col = lv_color_hex(0x38BDF8);
-
-    if (pst.stream_track[0] != '\0') {
-        track_txt = pst.stream_track;
-        artist_txt = pst.stream_artist;
-        if (strlen(track_txt) > 34) {
-            track_font = &lv_font_montserrat_16;
-        }
-    } else if (pst.stream_title[0] != '\0') {
-        track_txt = pst.stream_title;
-        if (strlen(track_txt) > 34) {
-            track_font = &lv_font_montserrat_16;
-        }
-    } else if (wst.state == WIFI_MGR_AP_CONFIG_MODE && pst.state == PLAYER_STATE_STOPPED) {
-        track_txt = "Wi-Fi Setup";
-        artist_txt = "AP: ES3C28P-Radio\nhttp://192.168.4.1";
-        track_font = &lv_font_montserrat_16;
-        artist_col = lv_color_hex(0xFBBF24);
-    } else if (pst.state == PLAYER_STATE_STOPPED) {
-        track_txt = "Stopped";
-        artist_txt = "Tap: Play / Stop\nSwipe L/R: Station\nSwipe U/D: Volume";
-        artist_col = lv_color_hex(0x64748B);
-    } else {
-        track_txt = pst.status_msg[0] ? pst.status_msg : "Connecting...";
-        track_font = &lv_font_montserrat_16;
-    }
-
-    if (lv_obj_get_style_text_font(s_lbl_track, 0) != track_font) {
-        lv_obj_set_style_text_font(s_lbl_track, track_font, 0);
-    }
-    if (strcmp(lv_label_get_text(s_lbl_track), track_txt) != 0) {
-        lv_label_set_text(s_lbl_track, track_txt);
-    }
-
-    if (artist_txt[0] != '\0') {
-        lv_obj_clear_flag(s_lbl_artist, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_style_text_color(s_lbl_artist, artist_col, 0);
-        if (strcmp(lv_label_get_text(s_lbl_artist), artist_txt) != 0) {
-            lv_label_set_text(s_lbl_artist, artist_txt);
-        }
-    } else {
-        lv_obj_add_flag(s_lbl_artist, LV_OBJ_FLAG_HIDDEN);
-    }
-
-    /* State pill */
-    const char *state_txt = "STOP";
-    uint32_t pill_col = 0x475569;
-    switch (pst.state) {
-    case PLAYER_STATE_CONNECTING:
-        state_txt = "CONN";
-        pill_col = 0xD97706;
-        break;
-    case PLAYER_STATE_BUFFERING:
-        state_txt = "BUF";
-        pill_col = 0x0284C7;
-        break;
-    case PLAYER_STATE_PLAYING:
-        state_txt = "LIVE";
-        pill_col = 0x059669;
-        break;
-    case PLAYER_STATE_ERROR:
-        state_txt = "ERR";
-        pill_col = 0xDC2626;
-        break;
-    default:
-        break;
-    }
-    if (strcmp(lv_label_get_text(s_lbl_state_pill), state_txt) != 0) {
-        lv_label_set_text(s_lbl_state_pill, state_txt);
-    }
-    lv_obj_set_style_bg_color(s_lbl_state_pill, lv_color_hex(pill_col), 0);
-
-    /* Codec info (integer formatting; LVGL printf does not enable %f) */
-    if (pst.state == PLAYER_STATE_PLAYING || pst.state == PLAYER_STATE_BUFFERING) {
-        uint32_t sr_khz = pst.sample_rate / 1000;
-        uint32_t sr_tenths = (pst.sample_rate % 1000) / 100;
-        if (pst.sample_rate > 0) {
-            lv_label_set_text_fmt(s_lbl_codec_info, "%s %luk  %lu.%lukHz",
-                                  pst.codec_name[0] ? pst.codec_name : "MP3",
-                                  (unsigned long)pst.bitrate_kbps,
-                                  (unsigned long)sr_khz,
-                                  (unsigned long)sr_tenths);
+        if (pst.stream_track[0] != '\0') {
+            track_txt = pst.stream_track;
+            artist_txt = pst.stream_artist;
+            if (strlen(track_txt) > 36) {
+                track_font = &lv_font_montserrat_16;
+            }
+        } else if (pst.stream_title[0] != '\0') {
+            track_txt = pst.stream_title;
+            if (strlen(track_txt) > 36) {
+                track_font = &lv_font_montserrat_16;
+            }
         } else {
-            lv_label_set_text_fmt(s_lbl_codec_info, "%s %luk",
-                                  pst.codec_name[0] ? pst.codec_name : "MP3",
-                                  (unsigned long)pst.bitrate_kbps);
+            track_txt = pst.status_msg[0] ? pst.status_msg : "Connecting...";
+            track_font = &lv_font_montserrat_16;
         }
-    } else {
-        lv_label_set_text(s_lbl_codec_info, pst.status_msg);
-    }
 
-    lv_bar_set_value(s_bar_buf, pst.buffer_pct, LV_ANIM_OFF);
+        outlined_label_set_font(&s_ol_track, track_font);
+        outlined_label_set_text(&s_ol_track, track_txt);
 
-    /* Network / Settings view */
-    if (s_cur_view == VIEW_NETWORK) {
+        if (artist_txt[0] != '\0') {
+            outlined_label_set_hidden(&s_ol_artist, false);
+            outlined_label_set_color(&s_ol_artist, lv_color_hex(0x7DD3FC));
+            outlined_label_set_text(&s_ol_artist, artist_txt);
+        } else {
+            outlined_label_set_hidden(&s_ol_artist, true);
+        }
+    } else if (poll_wifi && s_cur_view == VIEW_STOPPED && s_stop_tab == STOP_TAB_SETTINGS) {
         if (wst.state == WIFI_MGR_CONNECTED_STA) {
             lv_label_set_text(s_lbl_net_mode, "Wi-Fi Station (Connected)");
             lv_label_set_text_fmt(s_lbl_net_detail,
@@ -535,62 +685,14 @@ static void ui_timer_cb(lv_timer_t *timer)
     }
 }
 
-static lv_obj_t *create_subview_header(lv_obj_t *parent, const char *title,
-                                       const char *alt_btn_txt, lv_event_cb_t alt_cb)
-{
-    lv_obj_t *hdr = lv_obj_create(parent);
-    lv_obj_set_size(hdr, 320, 36);
-    lv_obj_align(hdr, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_bg_color(hdr, lv_color_hex(0x111827), 0);
-    lv_obj_set_style_border_width(hdr, 0, 0);
-    lv_obj_set_style_radius(hdr, 0, 0);
-    lv_obj_set_style_pad_hor(hdr, 8, 0);
-    lv_obj_set_style_pad_ver(hdr, 4, 0);
-    lv_obj_clear_flag(hdr, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *btn_back = lv_button_create(hdr);
-    lv_obj_set_size(btn_back, 64, 26);
-    lv_obj_align(btn_back, LV_ALIGN_LEFT_MID, 0, 0);
-    lv_obj_set_style_radius(btn_back, 6, 0);
-    lv_obj_set_style_bg_color(btn_back, lv_color_hex(0x243447), 0);
-    lv_obj_set_style_shadow_width(btn_back, 0, 0);
-    lv_obj_add_event_cb(btn_back, on_back_to_player_clicked, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lbl_b = lv_label_create(btn_back);
-    lv_label_set_text(lbl_b, LV_SYMBOL_LEFT " Back");
-    lv_obj_set_style_text_font(lbl_b, &lv_font_montserrat_12, 0);
-    lv_obj_center(lbl_b);
-
-    lv_obj_t *lbl_t = lv_label_create(hdr);
-    lv_label_set_text(lbl_t, title);
-    lv_obj_set_style_text_font(lbl_t, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(lbl_t, lv_color_hex(0xF8FAFC), 0);
-    lv_obj_align(lbl_t, LV_ALIGN_CENTER, -6, 0);
-
-    if (alt_btn_txt && alt_cb) {
-        lv_obj_t *btn_alt = lv_button_create(hdr);
-        lv_obj_set_size(btn_alt, 64, 26);
-        lv_obj_align(btn_alt, LV_ALIGN_RIGHT_MID, 0, 0);
-        lv_obj_set_style_radius(btn_alt, 6, 0);
-        lv_obj_set_style_bg_color(btn_alt, lv_color_hex(0x243447), 0);
-        lv_obj_set_style_shadow_width(btn_alt, 0, 0);
-        lv_obj_add_event_cb(btn_alt, alt_cb, LV_EVENT_CLICKED, NULL);
-        lv_obj_t *lbl_a = lv_label_create(btn_alt);
-        lv_label_set_text(lbl_a, alt_btn_txt);
-        lv_obj_set_style_text_font(lbl_a, &lv_font_montserrat_12, 0);
-        lv_obj_center(lbl_a);
-    }
-
-    return hdr;
-}
-
 static void build_ui(void)
 {
     s_scr_main = lv_screen_active();
-    lv_obj_set_style_bg_color(s_scr_main, lv_color_hex(0x0B1120), 0);
+    lv_obj_set_style_bg_color(s_scr_main, lv_color_hex(0x000000), 0);
     lv_obj_set_style_pad_all(s_scr_main, 0, 0);
-    lv_obj_clear_flag(s_scr_main, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollable(s_scr_main, false);
 
-    /* Allocate RGB565 artwork pixel buffer in PSRAM */
+    /* Allocate full 320x240 RGB565 artwork pixel buffer in PSRAM */
     s_art_pixels = heap_caps_malloc(ALBUM_ART_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_art_pixels) {
         s_art_pixels = malloc(ALBUM_ART_BYTES);
@@ -612,153 +714,96 @@ static void build_ui(void)
         };
     }
 
-    /* ---------- View 1: Full-screen Gesture Player (320x240) ---------- */
+    /* ---------- View 1: Minimalist Full-Bleed Artwork Player (320x240, ZERO buttons) ---------- */
     s_panel_player = lv_obj_create(s_scr_main);
     lv_obj_set_size(s_panel_player, 320, 240);
     lv_obj_align(s_panel_player, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_opa(s_panel_player, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_bg_color(s_panel_player, lv_color_hex(0x000000), 0);
     lv_obj_set_style_border_width(s_panel_player, 0, 0);
     lv_obj_set_style_pad_all(s_panel_player, 0, 0);
-    lv_obj_clear_flag(s_panel_player, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(s_panel_player, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_scrollable(s_panel_player, false);
+    lv_obj_set_clickable(s_panel_player, true);
     lv_obj_add_event_cb(s_panel_player, on_player_gesture_event, LV_EVENT_ALL, NULL);
 
-    /* Top Header: Station Name + State Pill + Subtle Corner Icons */
-    s_lbl_station = lv_label_create(s_panel_player);
-    lv_label_set_text(s_lbl_station, "1. SomaFM");
-    lv_label_set_long_mode(s_lbl_station, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_width(s_lbl_station, 194);
-    lv_obj_set_style_text_font(s_lbl_station, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(s_lbl_station, lv_color_hex(0x38BDF8), 0);
-    lv_obj_set_pos(s_lbl_station, 10, 8);
-
-    s_lbl_state_pill = lv_label_create(s_panel_player);
-    lv_label_set_text(s_lbl_state_pill, "STOP");
-    lv_obj_set_style_text_font(s_lbl_state_pill, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(s_lbl_state_pill, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_bg_color(s_lbl_state_pill, lv_color_hex(0x475569), 0);
-    lv_obj_set_style_bg_opa(s_lbl_state_pill, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_lbl_state_pill, 5, 0);
-    lv_obj_set_style_pad_hor(s_lbl_state_pill, 6, 0);
-    lv_obj_set_style_pad_ver(s_lbl_state_pill, 2, 0);
-    lv_obj_align(s_lbl_state_pill, LV_ALIGN_TOP_RIGHT, -66, 8);
-
-    lv_obj_t *btn_list = lv_button_create(s_panel_player);
-    lv_obj_set_size(btn_list, 26, 24);
-    lv_obj_align(btn_list, LV_ALIGN_TOP_RIGHT, -35, 6);
-    lv_obj_set_style_radius(btn_list, 6, 0);
-    lv_obj_set_style_bg_color(btn_list, lv_color_hex(0x162032), 0);
-    lv_obj_set_style_border_color(btn_list, lv_color_hex(0x1E293B), 0);
-    lv_obj_set_style_border_width(btn_list, 1, 0);
-    lv_obj_set_style_shadow_width(btn_list, 0, 0);
-    lv_obj_set_ext_click_area(btn_list, 6);
-    lv_obj_add_event_cb(btn_list, on_nav_stations_clicked, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lbl_list = lv_label_create(btn_list);
-    lv_label_set_text(lbl_list, LV_SYMBOL_LIST);
-    lv_obj_set_style_text_font(lbl_list, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(lbl_list, lv_color_hex(0x94A3B8), 0);
-    lv_obj_center(lbl_list);
-
-    lv_obj_t *btn_net = lv_button_create(s_panel_player);
-    lv_obj_set_size(btn_net, 26, 24);
-    lv_obj_align(btn_net, LV_ALIGN_TOP_RIGHT, -6, 6);
-    lv_obj_set_style_radius(btn_net, 6, 0);
-    lv_obj_set_style_bg_color(btn_net, lv_color_hex(0x162032), 0);
-    lv_obj_set_style_border_color(btn_net, lv_color_hex(0x1E293B), 0);
-    lv_obj_set_style_border_width(btn_net, 1, 0);
-    lv_obj_set_style_shadow_width(btn_net, 0, 0);
-    lv_obj_set_ext_click_area(btn_net, 6);
-    lv_obj_add_event_cb(btn_net, on_nav_net_clicked, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lbl_net = lv_label_create(btn_net);
-    lv_label_set_text(lbl_net, LV_SYMBOL_SETTINGS);
-    lv_obj_set_style_text_font(lbl_net, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(lbl_net, lv_color_hex(0x94A3B8), 0);
-    lv_obj_center(lbl_net);
-
-    /* Subtle Divider */
-    lv_obj_t *divider = lv_obj_create(s_panel_player);
-    lv_obj_set_size(divider, 300, 1);
-    lv_obj_set_pos(divider, 10, 36);
-    lv_obj_set_style_bg_color(divider, lv_color_hex(0x1E293B), 0);
-    lv_obj_set_style_border_width(divider, 0, 0);
-    lv_obj_clear_flag(divider, LV_OBJ_FLAG_CLICKABLE);
-
-    /* Left: Album Artwork Card (132x132 containing 128x128 RGB565 image) */
-    lv_obj_t *art_frame = lv_obj_create(s_panel_player);
-    lv_obj_set_size(art_frame, 132, 132);
-    lv_obj_set_pos(art_frame, 10, 46);
-    lv_obj_set_style_bg_color(art_frame, lv_color_hex(0x162032), 0);
-    lv_obj_set_style_border_color(art_frame, lv_color_hex(0x1E3A5F), 0);
-    lv_obj_set_style_border_width(art_frame, 1, 0);
-    lv_obj_set_style_radius(art_frame, 10, 0);
-    lv_obj_set_style_pad_all(art_frame, 0, 0);
-    lv_obj_set_style_clip_corner(art_frame, true, 0);
-    lv_obj_clear_flag(art_frame, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
-
-    s_img_art = lv_image_create(art_frame);
+    /* Maximized 320x240 artwork canvas (240x240 cover + ambient wings) */
+    s_img_art = lv_image_create(s_panel_player);
     if (s_art_pixels) {
         lv_image_set_src(s_img_art, &s_art_dsc);
     }
     lv_obj_set_size(s_img_art, ALBUM_ART_WIDTH, ALBUM_ART_HEIGHT);
-    lv_obj_set_style_radius(s_img_art, 8, 0);
-    lv_obj_set_style_clip_corner(s_img_art, true, 0);
-    lv_obj_center(s_img_art);
+    lv_obj_align(s_img_art, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_clickable(s_img_art, false);
 
-    /* Codec & buffer indicator cleanly tucked below artwork */
-    s_lbl_codec_info = lv_label_create(s_panel_player);
-    lv_label_set_text(s_lbl_codec_info, "");
-    lv_obj_set_width(s_lbl_codec_info, 132);
-    lv_obj_set_style_text_align(s_lbl_codec_info, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(s_lbl_codec_info, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(s_lbl_codec_info, lv_color_hex(0x64748B), 0);
-    lv_obj_set_pos(s_lbl_codec_info, 10, 186);
+    /* Smooth bottom dark scrim so overlapping track/artist remains crisp over bright art */
+    static const lv_color_t scrim_colors[2] = {
+        LV_COLOR_MAKE(0, 0, 0),
+        LV_COLOR_MAKE(0, 0, 0),
+    };
+    static const lv_opa_t scrim_opa[2] = { LV_OPA_TRANSP, LV_OPA_80 };
+    lv_grad_init_stops(&s_scrim_grad, scrim_colors, scrim_opa, NULL, 2);
+    lv_grad_vertical_init(&s_scrim_grad);
 
-    s_bar_buf = lv_bar_create(s_panel_player);
-    lv_obj_set_size(s_bar_buf, 132, 4);
-    lv_bar_set_range(s_bar_buf, 0, 100);
-    lv_bar_set_value(s_bar_buf, 0, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(s_bar_buf, lv_color_hex(0x1E293B), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_bar_buf, lv_color_hex(0x38BDF8), LV_PART_INDICATOR);
-    lv_obj_set_pos(s_bar_buf, 10, 206);
+    lv_obj_t *scrim = lv_obj_create(s_panel_player);
+    lv_obj_set_size(scrim, 320, 110);
+    lv_obj_align(scrim, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_border_width(scrim, 0, 0);
+    lv_obj_set_style_radius(scrim, 0, 0);
+    lv_obj_set_style_bg_grad(scrim, &s_scrim_grad, 0);
+    lv_obj_set_scrollable(scrim, false);
+    lv_obj_set_clickable(scrim, false);
 
-    /* Right: Track Title & Artist Name Flex Column */
+    /* Outlined Track Title & Artist Name near bottom */
     lv_obj_t *meta_box = lv_obj_create(s_panel_player);
-    lv_obj_set_size(meta_box, 160, 178);
-    lv_obj_set_pos(meta_box, 152, 44);
+    lv_obj_set_size(meta_box, 304, LV_SIZE_CONTENT);
+    lv_obj_align(meta_box, LV_ALIGN_BOTTOM_MID, 0, -8);
     lv_obj_set_style_bg_opa(meta_box, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(meta_box, 0, 0);
-    lv_obj_set_style_pad_all(meta_box, 2, 0);
+    lv_obj_set_style_pad_all(meta_box, 0, 0);
     lv_obj_set_flex_flow(meta_box, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(meta_box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_set_style_pad_row(meta_box, 8, 0);
-    lv_obj_clear_flag(meta_box, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_flex_align(meta_box, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(meta_box, 2, 0);
+    lv_obj_set_scrollable(meta_box, false);
+    lv_obj_set_clickable(meta_box, false);
 
-    s_lbl_track = lv_label_create(meta_box);
-    lv_label_set_text(s_lbl_track, "Ready");
-    lv_label_set_long_mode(s_lbl_track, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(s_lbl_track, 156);
-    lv_obj_set_style_text_font(s_lbl_track, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(s_lbl_track, lv_color_hex(0xF8FAFC), 0);
+    outlined_label_create(meta_box, &s_ol_track, 296, &lv_font_montserrat_20,
+                          lv_color_hex(0xFFFFFF), LV_TEXT_ALIGN_CENTER);
+    outlined_label_create(meta_box, &s_ol_artist, 296, &lv_font_montserrat_16,
+                          lv_color_hex(0x7DD3FC), LV_TEXT_ALIGN_CENTER);
 
-    s_lbl_artist = lv_label_create(meta_box);
-    lv_label_set_text(s_lbl_artist, "");
-    lv_label_set_long_mode(s_lbl_artist, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(s_lbl_artist, 156);
-    lv_obj_set_style_text_font(s_lbl_artist, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(s_lbl_artist, lv_color_hex(0x38BDF8), 0);
+    /* Temporary 2-second Station Name Banner (hidden except for 2s on station switch) */
+    s_station_banner = lv_obj_create(s_panel_player);
+    lv_obj_set_size(s_station_banner, LV_SIZE_CONTENT, 32);
+    lv_obj_align(s_station_banner, LV_ALIGN_TOP_MID, 0, 10);
+    lv_obj_set_style_bg_color(s_station_banner, lv_color_hex(0x0F172A), 0);
+    lv_obj_set_style_bg_opa(s_station_banner, 220, 0);
+    lv_obj_set_style_border_color(s_station_banner, lv_color_hex(0x38BDF8), 0);
+    lv_obj_set_style_border_width(s_station_banner, 1, 0);
+    lv_obj_set_style_radius(s_station_banner, 16, 0);
+    lv_obj_set_style_pad_hor(s_station_banner, 14, 0);
+    lv_obj_set_style_pad_ver(s_station_banner, 5, 0);
+    lv_obj_set_scrollable(s_station_banner, false);
+    lv_obj_set_clickable(s_station_banner, false);
+    lv_obj_set_hidden(s_station_banner, true);
 
-    /* Floating Gesture OSD Overlay (hidden unless gesturing) */
+    s_lbl_station_banner = lv_label_create(s_station_banner);
+    lv_label_set_text(s_lbl_station_banner, "");
+    lv_obj_set_style_text_font(s_lbl_station_banner, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(s_lbl_station_banner, lv_color_hex(0xF8FAFC), 0);
+    lv_obj_center(s_lbl_station_banner);
+
+    /* Temporary Volume Gesture OSD Overlay */
     s_osd_box = lv_obj_create(s_panel_player);
-    lv_obj_set_size(s_osd_box, 210, 46);
-    lv_obj_align(s_osd_box, LV_ALIGN_BOTTOM_MID, 0, -14);
+    lv_obj_set_size(s_osd_box, 200, 44);
+    lv_obj_align(s_osd_box, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_bg_color(s_osd_box, lv_color_hex(0x0F172A), 0);
-    lv_obj_set_style_bg_opa(s_osd_box, 235, 0);
+    lv_obj_set_style_bg_opa(s_osd_box, 230, 0);
     lv_obj_set_style_border_color(s_osd_box, lv_color_hex(0x38BDF8), 0);
     lv_obj_set_style_border_width(s_osd_box, 1, 0);
     lv_obj_set_style_radius(s_osd_box, 12, 0);
     lv_obj_set_style_pad_all(s_osd_box, 6, 0);
-    lv_obj_clear_flag(s_osd_box, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(s_osd_box, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_scrollable(s_osd_box, false);
+    lv_obj_set_clickable(s_osd_box, false);
+    lv_obj_set_hidden(s_osd_box, true);
 
     s_osd_lbl = lv_label_create(s_osd_box);
     lv_label_set_text(s_osd_lbl, "");
@@ -767,70 +812,124 @@ static void build_ui(void)
     lv_obj_align(s_osd_lbl, LV_ALIGN_TOP_MID, 0, 0);
 
     s_osd_bar = lv_bar_create(s_osd_box);
-    lv_obj_set_size(s_osd_bar, 176, 6);
+    lv_obj_set_size(s_osd_bar, 168, 6);
     lv_bar_set_range(s_osd_bar, 0, 100);
     lv_bar_set_value(s_osd_bar, 50, LV_ANIM_OFF);
     lv_obj_set_style_bg_color(s_osd_bar, lv_color_hex(0x334155), LV_PART_MAIN);
     lv_obj_set_style_bg_color(s_osd_bar, lv_color_hex(0x38BDF8), LV_PART_INDICATOR);
     lv_obj_align(s_osd_bar, LV_ALIGN_BOTTOM_MID, 0, -2);
 
-    /* ---------- View 2: Stations List (320x240) ---------- */
-    s_panel_stations = lv_obj_create(s_scr_main);
-    lv_obj_set_size(s_panel_stations, 320, 240);
-    lv_obj_align(s_panel_stations, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_opa(s_panel_stations, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(s_panel_stations, 0, 0);
-    lv_obj_set_style_pad_all(s_panel_stations, 0, 0);
-    lv_obj_clear_flag(s_panel_stations, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(s_panel_stations, LV_OBJ_FLAG_HIDDEN);
+    /* ---------- View 2: Unified Stopped Screen (Stations + Settings + Sleep) ---------- */
+    s_panel_stopped = lv_obj_create(s_scr_main);
+    lv_obj_set_size(s_panel_stopped, 320, 240);
+    lv_obj_align(s_panel_stopped, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(s_panel_stopped, lv_color_hex(0x0B1120), 0);
+    lv_obj_set_style_border_width(s_panel_stopped, 0, 0);
+    lv_obj_set_style_pad_all(s_panel_stopped, 0, 0);
+    lv_obj_set_scrollable(s_panel_stopped, false);
+    lv_obj_set_hidden(s_panel_stopped, true);
 
-    create_subview_header(s_panel_stations, "Stations", LV_SYMBOL_SETTINGS " Net", on_nav_net_clicked);
+    /* Top Control Strip (320x42) */
+    lv_obj_t *stop_hdr = lv_obj_create(s_panel_stopped);
+    lv_obj_set_size(stop_hdr, 320, 42);
+    lv_obj_align(stop_hdr, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(stop_hdr, lv_color_hex(0x111827), 0);
+    lv_obj_set_style_border_width(stop_hdr, 0, 0);
+    lv_obj_set_style_radius(stop_hdr, 0, 0);
+    lv_obj_set_style_pad_hor(stop_hdr, 6, 0);
+    lv_obj_set_style_pad_ver(stop_hdr, 6, 0);
+    lv_obj_set_flex_flow(stop_hdr, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(stop_hdr, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_scrollable(stop_hdr, false);
 
-    s_list_stations = lv_obj_create(s_panel_stations);
-    lv_obj_set_size(s_list_stations, 308, 194);
-    lv_obj_align(s_list_stations, LV_ALIGN_BOTTOM_MID, 0, -4);
+    create_hdr_btn(stop_hdr, LV_SYMBOL_PLAY " Play", 70, 30, 0x0EA5E9, on_play_resume_clicked);
+    s_btn_tab_stations = create_hdr_btn(stop_hdr, LV_SYMBOL_LIST " Stations", 82, 30, 0x0369A1, on_tab_stations_clicked);
+    s_btn_tab_settings = create_hdr_btn(stop_hdr, LV_SYMBOL_SETTINGS " Settings", 82, 30, 0x1E293B, on_tab_settings_clicked);
+    create_hdr_btn(stop_hdr, LV_SYMBOL_POWER " Sleep", 66, 30, 0x334155, on_sleep_clicked);
+
+    /* Tab A: Station List */
+    s_tab_stations = lv_obj_create(s_panel_stopped);
+    lv_obj_set_size(s_tab_stations, 320, 198);
+    lv_obj_align(s_tab_stations, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_opa(s_tab_stations, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_tab_stations, 0, 0);
+    lv_obj_set_style_pad_all(s_tab_stations, 4, 0);
+    lv_obj_set_scrollable(s_tab_stations, false);
+
+    s_list_stations = lv_obj_create(s_tab_stations);
+    lv_obj_set_size(s_list_stations, 310, 190);
+    lv_obj_center(s_list_stations);
     lv_obj_set_style_bg_opa(s_list_stations, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_list_stations, 0, 0);
     lv_obj_set_style_pad_all(s_list_stations, 2, 0);
     lv_obj_set_flex_flow(s_list_stations, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(s_list_stations, 6, 0);
 
-    /* ---------- View 3: Settings & Network Info (320x240) ---------- */
-    s_panel_network = lv_obj_create(s_scr_main);
-    lv_obj_set_size(s_panel_network, 320, 240);
-    lv_obj_align(s_panel_network, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_opa(s_panel_network, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(s_panel_network, 0, 0);
-    lv_obj_set_style_pad_all(s_panel_network, 0, 0);
-    lv_obj_clear_flag(s_panel_network, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(s_panel_network, LV_OBJ_FLAG_HIDDEN);
+    /* Tab B: Settings & Wi-Fi Info */
+    s_tab_settings = lv_obj_create(s_panel_stopped);
+    lv_obj_set_size(s_tab_settings, 320, 198);
+    lv_obj_align(s_tab_settings, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_opa(s_tab_settings, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_tab_settings, 0, 0);
+    lv_obj_set_style_pad_all(s_tab_settings, 10, 0);
+    lv_obj_set_scrollable(s_tab_settings, false);
+    lv_obj_set_hidden(s_tab_settings, true);
 
-    create_subview_header(s_panel_network, "Settings & Wi-Fi", LV_SYMBOL_LIST " List", on_nav_stations_clicked);
-
-    s_lbl_net_mode = lv_label_create(s_panel_network);
+    s_lbl_net_mode = lv_label_create(s_tab_settings);
     lv_label_set_text(s_lbl_net_mode, "Network Info");
     lv_obj_set_style_text_font(s_lbl_net_mode, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(s_lbl_net_mode, lv_color_hex(0x38BDF8), 0);
-    lv_obj_set_pos(s_lbl_net_mode, 12, 44);
+    lv_obj_set_pos(s_lbl_net_mode, 2, 0);
 
-    s_lbl_net_detail = lv_label_create(s_panel_network);
+    s_lbl_net_detail = lv_label_create(s_tab_settings);
     lv_label_set_text(s_lbl_net_detail, "...");
     lv_obj_set_style_text_font(s_lbl_net_detail, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_lbl_net_detail, lv_color_hex(0xE2E8F0), 0);
-    lv_obj_set_pos(s_lbl_net_detail, 12, 70);
+    lv_obj_set_pos(s_lbl_net_detail, 2, 24);
 
-    s_lbl_net_hint = lv_label_create(s_panel_network);
+    s_lbl_net_hint = lv_label_create(s_tab_settings);
     lv_label_set_text(s_lbl_net_hint, "...");
     lv_obj_set_style_text_font(s_lbl_net_hint, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_lbl_net_hint, lv_color_hex(0x94A3B8), 0);
-    lv_obj_set_pos(s_lbl_net_hint, 12, 134);
+    lv_obj_set_pos(s_lbl_net_hint, 2, 86);
 
-    create_ctrl_btn(s_panel_network, "Enable AP Config Mode", 220, 36, 0x0369A1, on_start_ap_clicked);
-    lv_obj_t *btn_ap = lv_obj_get_child(s_panel_network, -1);
-    lv_obj_align(btn_ap, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_t *btn_ap = lv_button_create(s_tab_settings);
+    lv_obj_set_size(btn_ap, 220, 36);
+    lv_obj_align(btn_ap, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_obj_set_style_radius(btn_ap, 8, 0);
+    lv_obj_set_style_bg_color(btn_ap, lv_color_hex(0x0369A1), 0);
+    lv_obj_set_style_shadow_width(btn_ap, 0, 0);
+    lv_obj_add_event_cb(btn_ap, on_start_ap_clicked, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lbl_ap = lv_label_create(btn_ap);
+    lv_label_set_text(lbl_ap, "Enable AP Config Mode");
+    lv_obj_set_style_text_font(lbl_ap, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl_ap, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(lbl_ap);
+
+    /* ---------- View 3: Full-Screen Sleep Overlay (Tap anywhere to wake) ---------- */
+    s_panel_sleep = lv_obj_create(s_scr_main);
+    lv_obj_set_size(s_panel_sleep, 320, 240);
+    lv_obj_align(s_panel_sleep, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(s_panel_sleep, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_border_width(s_panel_sleep, 0, 0);
+    lv_obj_set_style_radius(s_panel_sleep, 0, 0);
+    lv_obj_set_scrollable(s_panel_sleep, false);
+    lv_obj_set_clickable(s_panel_sleep, true);
+    lv_obj_add_event_cb(s_panel_sleep, on_sleep_screen_event, LV_EVENT_ALL, NULL);
+    lv_obj_set_hidden(s_panel_sleep, true);
+
+    /* Initial view matches current playback state */
+    player_status_t pst;
+    audio_player_get_status(&pst);
+    if (pst.state == PLAYER_STATE_STOPPED) {
+        switch_view(VIEW_STOPPED);
+    } else {
+        switch_view(VIEW_PLAYER);
+        show_station_banner(pst.station_index, pst.station_name);
+    }
 
     rebuild_station_list();
-    lv_timer_create(ui_timer_cb, 250, NULL);
+    lv_timer_create(ui_timer_cb, 50, NULL);
 }
 
 esp_err_t display_ui_init(i2c_master_bus_handle_t i2c_bus)
@@ -847,7 +946,7 @@ esp_err_t display_ui_init(i2c_master_bus_handle_t i2c_bus)
         .sclk_io_num = BOARD_LCD_PIN_SCLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = 320 * 40 * sizeof(uint16_t),
+        .max_transfer_sz = 320 * 20 * sizeof(uint16_t),
     };
     ESP_ERROR_CHECK(spi_bus_initialize(BOARD_LCD_SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
 
@@ -890,14 +989,15 @@ esp_err_t display_ui_init(i2c_master_bus_handle_t i2c_bus)
     };
     ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_ft5x06(tp_io_handle, &tp_cfg, &s_touch_handle));
 
-    /* 3. LVGL Port */
-    const lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+    /* 3. LVGL Port: pin to Core 0 so Core 1 stays dedicated to audio_decode */
+    lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+    lvgl_cfg.task_affinity = 0;
     ESP_ERROR_CHECK(lvgl_port_init(&lvgl_cfg));
 
     const lvgl_port_display_cfg_t disp_cfg = {
         .io_handle = s_lcd_io,
         .panel_handle = s_lcd_panel,
-        .buffer_size = 320 * 40,
+        .buffer_size = 320 * 20,
         .double_buffer = true,
         .hres = BOARD_LCD_NATIVE_W,
         .vres = BOARD_LCD_NATIVE_H,

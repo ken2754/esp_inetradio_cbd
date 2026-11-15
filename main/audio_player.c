@@ -1,4 +1,5 @@
 #include "audio_player.h"
+#include "album_art.h"
 #include "app_config.h"
 #include "board_config.h"
 
@@ -27,11 +28,13 @@
 
 static const char *TAG = "audio_player";
 
-#define AUDIO_RINGBUF_SIZE      (192 * 1024)
-#define AUDIO_PREBUFFER_BYTES   (24 * 1024)
+#define AUDIO_RINGBUF_SIZE      (256 * 1024)
+#define AUDIO_PREBUFFER_BYTES   (36 * 1024)
 #define HTTP_READ_CHUNK_SIZE    4096
 #define DEC_IN_BUF_SIZE         8192
 #define DEC_OUT_BUF_SIZE        8192
+#define I2S_DMA_DESC_NUM        12
+#define I2S_DMA_FRAME_NUM       512
 #define MAX_REDIRECTS           5
 
 typedef enum {
@@ -55,6 +58,27 @@ static volatile int s_icy_metaint = 0;
 static volatile bool s_stream_eof = false;
 static uint32_t s_current_sample_rate = 44100;
 static bool s_codec_is_open = false;
+
+#define PENDING_META_Q_LEN 8
+typedef struct {
+    uint64_t byte_pos;
+    uint32_t gen;
+    uint32_t art_id;
+    int station_index;
+    int64_t queued_us;
+    uint32_t est_delay_ms;
+    char title[160];
+    char artist[96];
+    char track[128];
+} pending_meta_t;
+
+static uint64_t s_stream_bytes_pushed = 0;
+static uint64_t s_decode_bytes_consumed = 0;
+static pending_meta_t s_pending_q[PENDING_META_Q_LEN];
+static int s_pending_head = 0;
+static int s_pending_tail = 0;
+static volatile int s_pending_count = 0;
+static char s_last_icy_title[160] = {0};
 
 static void update_status_locked_start(void)
 {
@@ -80,8 +104,8 @@ static esp_err_t init_i2s_and_codec(i2c_master_bus_handle_t i2c_bus)
 {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(BOARD_AUDIO_I2S_PORT, I2S_ROLE_MASTER);
     chan_cfg.auto_clear = true;
-    chan_cfg.dma_desc_num = 8;
-    chan_cfg.dma_frame_num = 512;
+    chan_cfg.dma_desc_num = I2S_DMA_DESC_NUM;
+    chan_cfg.dma_frame_num = I2S_DMA_FRAME_NUM;
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &s_tx_handle, NULL));
 
     i2s_std_config_t std_cfg = {
@@ -243,14 +267,25 @@ static void flush_ringbuf(void)
         if (!p || item_size == 0) break;
         vRingbufferReturnItem(s_ringbuf, p);
     }
+    if (s_status_mutex) {
+        update_status_locked_start();
+        s_stream_bytes_pushed = 0;
+        s_decode_bytes_consumed = 0;
+        s_pending_head = 0;
+        s_pending_tail = 0;
+        s_pending_count = 0;
+        s_last_icy_title[0] = '\0';
+        update_status_locked_end();
+    }
 }
 
-static uint8_t get_ringbuf_pct(void)
+static uint8_t calc_buf_pct_locked(void)
 {
-    UBaseType_t waiting = 0;
-    vRingbufferGetInfo(s_ringbuf, NULL, NULL, NULL, NULL, &waiting);
-    uint32_t pct = ((uint32_t)waiting * 100) / AUDIO_RINGBUF_SIZE;
-    if (pct > 100) pct = 100;
+    uint64_t buffered = (s_stream_bytes_pushed >= s_decode_bytes_consumed)
+                            ? (s_stream_bytes_pushed - s_decode_bytes_consumed)
+                            : 0;
+    uint64_t pct = (buffered * 100ULL) / AUDIO_RINGBUF_SIZE;
+    if (pct > 100ULL) pct = 100ULL;
     return (uint8_t)pct;
 }
 
@@ -288,6 +323,7 @@ static void clear_track_metadata_locked(void)
     s_status.stream_title[0] = '\0';
     s_status.stream_artist[0] = '\0';
     s_status.stream_track[0] = '\0';
+    s_last_icy_title[0] = '\0';
 }
 
 static void trim_ws(char *s)
@@ -304,7 +340,7 @@ static void trim_ws(char *s)
     }
 }
 
-static void parse_icy_metadata(const char *meta_str)
+static void parse_icy_metadata(const char *meta_str, uint32_t gen, int station_index)
 {
     const char *p = strstr(meta_str, "StreamTitle='");
     if (!p) {
@@ -330,6 +366,18 @@ static void parse_icy_metadata(const char *meta_str)
     title_buf[len] = '\0';
     trim_ws(title_buf);
 
+    /* Ignore duplicate StreamTitle re-broadcasts by Icecast/Shoutcast servers */
+    update_status_locked_start();
+    bool dup = (title_buf[0] == '\0') || (strcmp(s_last_icy_title, title_buf) == 0);
+    if (!dup) {
+        snprintf(s_last_icy_title, sizeof(s_last_icy_title), "%s", title_buf);
+    }
+    uint64_t pushed = s_stream_bytes_pushed;
+    uint64_t consumed = s_decode_bytes_consumed;
+    uint32_t br_kbps = s_status.bitrate_kbps > 0 ? s_status.bitrate_kbps : 128;
+    update_status_locked_end();
+    if (dup) return;
+
     char artist_buf[96] = {0};
     char track_buf[128] = {0};
     const char *sep = strstr(title_buf, " - ");
@@ -346,12 +394,37 @@ static void parse_icy_metadata(const char *meta_str)
         snprintf(track_buf, sizeof(track_buf), "%.127s", title_buf);
     }
 
+    /* Pre-fetch & decode artwork immediately while buffered audio of previous song plays */
+    uint32_t art_id = album_art_prepare(station_index, artist_buf, track_buf);
+
+    uint32_t sr = s_current_sample_rate ? s_current_sample_rate : 44100;
+    uint32_t dma_ms = (I2S_DMA_DESC_NUM * I2S_DMA_FRAME_NUM * 1000U) / sr;
+    uint32_t pipe_ms = dma_ms + 26U; /* I2S DMA ring + ~1 frame decoder reservoir */
+    uint64_t in_flight = (pushed >= consumed) ? (pushed - consumed) : 0;
+    uint32_t est_delay_ms = (uint32_t)(((in_flight * 8ULL) / br_kbps) + pipe_ms);
+    uint64_t target_byte = pushed + (((uint64_t)br_kbps * pipe_ms) / 8ULL);
+
     update_status_locked_start();
-    snprintf(s_status.stream_title, sizeof(s_status.stream_title), "%s", title_buf);
-    snprintf(s_status.stream_artist, sizeof(s_status.stream_artist), "%s", artist_buf);
-    snprintf(s_status.stream_track, sizeof(s_status.stream_track), "%s", track_buf);
+    if (s_pending_count >= PENDING_META_Q_LEN) {
+        s_pending_head = (s_pending_head + 1) % PENDING_META_Q_LEN;
+        s_pending_count--;
+    }
+    pending_meta_t *pm = &s_pending_q[s_pending_tail];
+    pm->byte_pos = target_byte;
+    pm->gen = gen;
+    pm->art_id = art_id;
+    pm->station_index = station_index;
+    pm->queued_us = esp_timer_get_time();
+    pm->est_delay_ms = est_delay_ms;
+    snprintf(pm->title, sizeof(pm->title), "%s", title_buf);
+    snprintf(pm->artist, sizeof(pm->artist), "%s", artist_buf);
+    snprintf(pm->track, sizeof(pm->track), "%s", track_buf);
+    s_pending_tail = (s_pending_tail + 1) % PENDING_META_Q_LEN;
+    s_pending_count++;
     update_status_locked_end();
-    ESP_LOGI(TAG, "ICY StreamTitle: %s (artist='%s', track='%s')", title_buf, artist_buf, track_buf);
+
+    ESP_LOGI(TAG, "ICY queued: '%s' (buf=%lluB, est_delay=%lums, art_id=%lu)",
+             title_buf, (unsigned long long)in_flight, (unsigned long)est_delay_ms, (unsigned long)art_id);
 }
 
 static bool extract_playlist_url(const char *text, char *out_url, size_t out_len)
@@ -407,6 +480,10 @@ static bool push_audio_bytes(const uint8_t *data, size_t len, uint32_t gen)
         size_t chunk = len - offset;
         if (chunk > 2048) chunk = 2048;
         if (xRingbufferSend(s_ringbuf, data + offset, chunk, pdMS_TO_TICKS(100)) == pdTRUE) {
+            update_status_locked_start();
+            s_stream_bytes_pushed += chunk;
+            s_status.buffer_pct = calc_buf_pct_locked();
+            update_status_locked_end();
             offset += chunk;
         }
     }
@@ -620,17 +697,13 @@ static void stream_task(void *arg)
                             meta_len_rem -= take;
                             if (meta_len_rem == 0) {
                                 meta_buf[meta_pos] = '\0';
-                                parse_icy_metadata(meta_buf);
+                                parse_icy_metadata(meta_buf, gen, st_idx);
                                 meta_len_rem = -1;
                                 audio_rem = metaint;
                             }
                         }
                     }
                 }
-
-                update_status_locked_start();
-                s_status.buffer_pct = get_ringbuf_pct();
-                update_status_locked_end();
             }
 
             esp_http_client_close(client);
@@ -678,16 +751,54 @@ static int mix_and_write_pcm(uint8_t *pcm_bytes, size_t byte_len, uint8_t channe
     }
 }
 
+static void process_pending_metadata(uint32_t gen)
+{
+    if (s_pending_count == 0) return;
+
+    while (1) {
+        pending_meta_t pm;
+        bool fire = false;
+
+        update_status_locked_start();
+        if (s_pending_count > 0) {
+            pending_meta_t *head = &s_pending_q[s_pending_head];
+            if (head->gen != gen) {
+                s_pending_head = (s_pending_head + 1) % PENDING_META_Q_LEN;
+                s_pending_count--;
+                update_status_locked_end();
+                continue;
+            }
+            if (s_decode_bytes_consumed >= head->byte_pos) {
+                pm = *head;
+                s_pending_head = (s_pending_head + 1) % PENDING_META_Q_LEN;
+                s_pending_count--;
+                snprintf(s_status.stream_title, sizeof(s_status.stream_title), "%s", pm.title);
+                snprintf(s_status.stream_artist, sizeof(s_status.stream_artist), "%s", pm.artist);
+                snprintf(s_status.stream_track, sizeof(s_status.stream_track), "%s", pm.track);
+                fire = true;
+            }
+        }
+        update_status_locked_end();
+
+        if (!fire) break;
+
+        int64_t actual_ms = (esp_timer_get_time() - pm.queued_us) / 1000LL;
+        ESP_LOGI(TAG, "ICY committed: '%s' (est=%lums, actual=%lldms, art_id=%lu)",
+                 pm.title, (unsigned long)pm.est_delay_ms, actual_ms, (unsigned long)pm.art_id);
+        album_art_commit(pm.art_id, pm.station_index);
+    }
+}
+
 static void decode_task(void *arg)
 {
     esp_audio_dec_register_default();
     esp_audio_simple_dec_register_default();
 
-    uint8_t *in_buf = heap_caps_malloc(DEC_IN_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *in_buf = heap_caps_malloc(DEC_IN_BUF_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!in_buf) in_buf = malloc(DEC_IN_BUF_SIZE);
 
     size_t out_buf_cap = DEC_OUT_BUF_SIZE;
-    uint8_t *out_buf = heap_caps_malloc(out_buf_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *out_buf = heap_caps_malloc(out_buf_cap, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!out_buf) out_buf = malloc(out_buf_cap);
 
     while (1) {
@@ -707,9 +818,9 @@ static void decode_task(void *arg)
                 break;
             }
             update_status_locked_start();
-            s_status.buffer_pct = get_ringbuf_pct();
+            s_status.buffer_pct = calc_buf_pct_locked();
             update_status_locked_end();
-            vTaskDelay(pdMS_TO_TICKS(40));
+            vTaskDelay(pdMS_TO_TICKS(30));
         }
 
         if (!s_want_play || s_play_gen != gen) {
@@ -739,6 +850,8 @@ static void decode_task(void *arg)
         bool info_ready = false;
         esp_audio_simple_dec_info_t dec_info = {0};
         int err_streak = 0;
+        bool underrun_logged = false;
+        int64_t last_pcm_us = 0;
 
         while (s_want_play && s_play_gen == gen) {
             if (in_valid < DEC_IN_BUF_SIZE) {
@@ -754,8 +867,12 @@ static void decode_task(void *arg)
 
             if (in_valid == 0) {
                 if (s_stream_eof) break;
+                if (unmuted && !underrun_logged) {
+                    ESP_LOGW(TAG, "Audio underrun: ringbuf empty");
+                    underrun_logged = true;
+                }
                 set_status_msg(PLAYER_STATE_BUFFERING, "Buffering...");
-                vTaskDelay(pdMS_TO_TICKS(20));
+                vTaskDelay(pdMS_TO_TICKS(5));
                 continue;
             }
 
@@ -771,7 +888,10 @@ static void decode_task(void *arg)
 
             esp_audio_err_t ret = esp_audio_simple_dec_process(decoder, &raw, &out_frame);
             if (ret == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH && out_frame.needed_size > out_buf_cap) {
-                uint8_t *new_buf = heap_caps_realloc(out_buf, out_frame.needed_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                uint8_t *new_buf = heap_caps_realloc(out_buf, out_frame.needed_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                if (!new_buf) {
+                    new_buf = heap_caps_realloc(out_buf, out_frame.needed_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                }
                 if (new_buf) {
                     out_buf = new_buf;
                     out_buf_cap = out_frame.needed_size;
@@ -785,12 +905,41 @@ static void decode_task(void *arg)
                     memmove(in_buf, in_buf + raw.consumed, remain);
                 }
                 in_valid = remain;
+                update_status_locked_start();
+                s_decode_bytes_consumed += raw.consumed;
+                s_status.buffer_pct = calc_buf_pct_locked();
+                update_status_locked_end();
+            } else if (ret == ESP_AUDIO_ERR_DATA_LACK || (ret == ESP_AUDIO_ERR_OK && raw.consumed == 0 && out_frame.decoded_size == 0)) {
+                /* Need more bytes in buffer before a frame can decode */
+                size_t got = 0;
+                size_t space = DEC_IN_BUF_SIZE - in_valid;
+                if (space == 0) {
+                    in_valid = 0;
+                } else {
+                    void *rb_data = xRingbufferReceiveUpTo(s_ringbuf, &got, pdMS_TO_TICKS(50), space);
+                    if (rb_data && got > 0) {
+                        memcpy(in_buf + in_valid, rb_data, got);
+                        vRingbufferReturnItem(s_ringbuf, rb_data);
+                        in_valid += got;
+                    } else if (got == 0) {
+                        vTaskDelay(pdMS_TO_TICKS(5));
+                    }
+                }
+                continue;
             } else if (ret != ESP_AUDIO_ERR_OK) {
                 /* Skip 1 byte to resync frame header if stuck on bad data */
                 if (in_valid > 1) {
                     memmove(in_buf, in_buf + 1, in_valid - 1);
                     in_valid--;
+                    update_status_locked_start();
+                    s_decode_bytes_consumed += 1;
+                    update_status_locked_end();
                 } else {
+                    if (in_valid == 1) {
+                        update_status_locked_start();
+                        s_decode_bytes_consumed += 1;
+                        update_status_locked_end();
+                    }
                     in_valid = 0;
                 }
                 err_streak++;
@@ -804,6 +953,7 @@ static void decode_task(void *arg)
 
             if (ret == ESP_AUDIO_ERR_OK && out_frame.decoded_size > 0) {
                 err_streak = 0;
+                underrun_logged = false;
                 if (!info_ready) {
                     if (esp_audio_simple_dec_get_info(decoder, &dec_info) == ESP_AUDIO_ERR_OK &&
                         dec_info.sample_rate > 0) {
@@ -834,32 +984,25 @@ static void decode_task(void *arg)
                     first_log = true;
                 }
 
+                int64_t now_us = esp_timer_get_time();
+                if (last_pcm_us > 0 && (now_us - last_pcm_us) > 150000LL) {
+                    ESP_LOGW(TAG, "Audio output gap: %lld ms (buf=%u%%)",
+                             (long long)((now_us - last_pcm_us) / 1000LL), (unsigned)s_status.buffer_pct);
+                }
+
                 uint8_t ch = dec_info.channel ? dec_info.channel : 2;
                 int wret = mix_and_write_pcm(out_frame.buffer, out_frame.decoded_size, ch);
+                last_pcm_us = esp_timer_get_time();
                 if (first_log || wret != ESP_CODEC_DEV_OK) {
                     ESP_LOGI(TAG, "Codec write ret=%d decoded=%lu", wret, (unsigned long)out_frame.decoded_size);
                 }
+                process_pending_metadata(gen);
 
-                update_status_locked_start();
-                s_status.buffer_pct = get_ringbuf_pct();
                 if (s_status.state != PLAYER_STATE_PLAYING) {
+                    update_status_locked_start();
                     s_status.state = PLAYER_STATE_PLAYING;
                     snprintf(s_status.status_msg, sizeof(s_status.status_msg), "Playing");
-                }
-                update_status_locked_end();
-            } else if (ret == ESP_AUDIO_ERR_DATA_LACK || (ret == ESP_AUDIO_ERR_OK && raw.consumed == 0)) {
-                /* Need more bytes in buffer */
-                size_t got = 0;
-                size_t space = DEC_IN_BUF_SIZE - in_valid;
-                if (space == 0) {
-                    in_valid = 0;
-                } else {
-                    void *rb_data = xRingbufferReceiveUpTo(s_ringbuf, &got, pdMS_TO_TICKS(50), space);
-                    if (rb_data && got > 0) {
-                        memcpy(in_buf + in_valid, rb_data, got);
-                        vRingbufferReturnItem(s_ringbuf, rb_data);
-                        in_valid += got;
-                    }
+                    update_status_locked_end();
                 }
             }
         }
@@ -921,6 +1064,7 @@ esp_err_t audio_player_play_station(int index)
     s_play_gen++;
     vTaskDelay(pdMS_TO_TICKS(60));
     flush_ringbuf();
+    album_art_clear(index);
 
     radio_station_t st;
     app_config_get_station(index, &st);
@@ -945,6 +1089,7 @@ esp_err_t audio_player_stop(void)
     s_play_gen++;
     codec_set_active_mute(true);
     flush_ringbuf();
+    album_art_clear(s_status.station_index);
 
     update_status_locked_start();
     s_status.state = PLAYER_STATE_STOPPED;
