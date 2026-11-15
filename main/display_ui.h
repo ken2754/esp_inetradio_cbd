@@ -18,6 +18,15 @@ void display_ui_set_brightness(uint8_t pct);
 /* Rebuild station list UI after web UI changes */
 void display_ui_refresh_stations(void);
 
+/* Switch active view by name: "player", "wordclock", "agy", "stopped", "sleep" */
+void display_ui_switch_view_by_name(const char *name);
+
+/* Get active view name: "player", "wordclock", "agy", "stopped", or "sleep" */
+const char *display_ui_get_view_name(void);
+
+/* Re-apply Word Clock / Agy Dashboard settings from app_config */
+void display_ui_apply_agy_settings(void);
+
 #ifdef __cplusplus
 }
 #endif
