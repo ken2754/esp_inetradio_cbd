@@ -165,6 +165,8 @@ static lv_image_dsc_t s_art_dsc;
 static uint32_t s_shown_art_ver = 0;
 static bool s_art_ready = false;
 static bool s_has_art = false;
+static bool s_invert_color = true;
+static bool s_art_pixels_inverted = false;
 
 /* Unified Stopped screen widgets */
 static lv_obj_t *s_btn_tab_stations = NULL;
@@ -253,11 +255,48 @@ void display_ui_set_brightness(uint8_t pct)
     }
 }
 
+static void invert_rgb565_buffer(uint16_t *pixels, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        pixels[i] ^= 0xFFFFU;
+    }
+}
+
+/* Pre-invert artwork pixels when IPS hardware inversion is off so artwork keeps true colors */
+static void sync_art_inversion(bool invert_color)
+{
+    s_invert_color = invert_color;
+    bool want_art_invert = !invert_color;
+    if (s_art_pixels && s_art_ready && s_art_pixels_inverted != want_art_invert) {
+        invert_rgb565_buffer(s_art_pixels, ALBUM_ART_WIDTH * ALBUM_ART_HEIGHT);
+        s_art_pixels_inverted = want_art_invert;
+        if (s_bg_art) {
+            lv_image_cache_drop(&s_art_dsc);
+            lv_obj_invalidate(s_bg_art);
+        }
+    }
+}
+
+static bool reload_art_pixels(void)
+{
+    bool is_cover = false;
+    if (!s_art_pixels ||
+        !album_art_copy_rgb565(s_art_pixels, ALBUM_ART_BYTES, &is_cover, &s_shown_art_ver)) {
+        return false;
+    }
+    s_art_ready = true;
+    s_has_art = is_cover;
+    s_art_pixels_inverted = false;
+    sync_art_inversion(s_invert_color);
+    return true;
+}
+
 static void apply_orientation_and_color(bool invert_color, bool flip_180, bool swap_rb)
 {
     if (!s_lcd_panel || !s_lvgl_disp || !s_touch_handle) return;
 
     esp_lcd_panel_invert_color(s_lcd_panel, invert_color);
+    sync_art_inversion(invert_color);
 
     /* LVGL v9 lv_indev automatically rotates pointer coords via lv_display_rotate_point(),
      * so FT6336G stays in native portrait coords (240x320) without extra swap/mirror. */
@@ -1514,10 +1553,7 @@ static void ui_timer_cb(lv_timer_t *timer)
         (s_cur_view == VIEW_PLAYER || s_cur_view == VIEW_WORD_CLOCK || s_cur_view == VIEW_AGY_DASHBOARD)) {
         uint32_t cur_ver = album_art_get_version();
         if (cur_ver != s_shown_art_ver) {
-            bool is_cover = false;
-            if (album_art_copy_rgb565(s_art_pixels, ALBUM_ART_BYTES, &is_cover, &s_shown_art_ver)) {
-                s_art_ready = true;
-                s_has_art = is_cover;
+            if (reload_art_pixels()) {
                 lv_image_cache_drop(&s_art_dsc);
                 update_bg_art_visuals(pst.state);
                 lv_obj_invalidate(s_bg_art);
@@ -1609,11 +1645,6 @@ static void build_ui(void)
         s_art_pixels = malloc(ALBUM_ART_BYTES);
     }
     if (s_art_pixels) {
-        bool is_cover = false;
-        if (album_art_copy_rgb565(s_art_pixels, ALBUM_ART_BYTES, &is_cover, &s_shown_art_ver)) {
-            s_art_ready = true;
-            s_has_art = is_cover;
-        }
         s_art_dsc = (lv_image_dsc_t){
             .header = {
                 .magic = LV_IMAGE_HEADER_MAGIC,
@@ -1626,6 +1657,7 @@ static void build_ui(void)
             .data_size = ALBUM_ART_BYTES,
             .data = (const uint8_t *)s_art_pixels,
         };
+        reload_art_pixels();
     }
 
     /* Shared 320x240 album art backdrop (behind Player, Word Clock, and Agy Dashboard) */
