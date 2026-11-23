@@ -18,9 +18,6 @@ extern "C" {
 #define APP_MDNS_HOSTNAME       "es3c28p-radio"
 
 #define APP_TZ_LEN              32
-#define APP_OAUTH_ID_LEN        128
-#define APP_OAUTH_SEC_LEN       128
-#define APP_OAUTH_REFR_LEN      512
 
 typedef struct {
     char name[APP_STATION_NAME_LEN];
@@ -47,11 +44,7 @@ typedef struct {
     char timezone[APP_TZ_LEN];
     uint8_t wc_font_mode;
     uint16_t idle_clock_sec;
-    uint8_t idle_clock_view;
-    char oauth_client_id[APP_OAUTH_ID_LEN];
-    char oauth_client_secret[APP_OAUTH_SEC_LEN];
-    char oauth_refresh_token[APP_OAUTH_REFR_LEN];
-} app_agy_config_t;
+} app_clock_config_t;
 
 esp_err_t app_config_init(void);
 
@@ -75,9 +68,9 @@ esp_err_t app_config_set_autoplay(bool autoplay);
 esp_err_t app_config_set_display(uint8_t brightness, bool invert_color, bool flip_180, bool swap_rb);
 esp_err_t app_config_set_brightness(uint8_t brightness);
 
-/* Clock & Antigravity Quota configuration */
-void app_config_get_agy(app_agy_config_t *out_agy);
-esp_err_t app_config_set_agy(const app_agy_config_t *agy);
+/* Word Clock & SNTP configuration */
+void app_config_get_clock(app_clock_config_t *out_clock);
+esp_err_t app_config_set_clock(const app_clock_config_t *clock);
 esp_err_t app_config_set_wc_font(uint8_t font_mode);
 
 #ifdef __cplusplus

@@ -4,5 +4,4 @@ sdkconfig
 sdkconfig.old
 dependencies.lock
 .DS_Store
-tools/client_secret.json
 

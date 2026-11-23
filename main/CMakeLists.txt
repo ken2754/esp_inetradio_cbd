@@ -9,7 +9,6 @@ idf_component_register(
         "web_server.c"
         "sntp_time.c"
         "word_clock.c"
-        "google_quota.c"
     INCLUDE_DIRS "."
     REQUIRES
         nvs_flash

@@ -13,8 +13,8 @@ static const char *TAG = "app_config";
 #define NVS_NAMESPACE   "radio_cfg"
 #define NVS_KEY_META    "meta_v2"
 #define NVS_KEY_ST_FMT  "st_%d"
-#define NVS_KEY_AGY     "agy_v1"
-#define DEFAULT_AGY_TZ  "JST-9"
+#define NVS_KEY_CLOCK   "clock_v1"
+#define DEFAULT_CLOCK_TZ "JST-9"
 
 typedef struct {
     app_config_meta_t meta;
@@ -22,7 +22,7 @@ typedef struct {
 } app_config_t;
 
 static app_config_t s_cfg;
-static app_agy_config_t s_agy;
+static app_clock_config_t s_clock;
 static SemaphoreHandle_t s_cfg_mutex = NULL;
 
 static void safe_copy_str(char *dst, size_t dst_len, const char *src)
@@ -106,13 +106,12 @@ static void load_defaults_locked(void)
     load_default_stations_locked();
 }
 
-static void load_agy_defaults_locked(void)
+static void load_clock_defaults_locked(void)
 {
-    memset(&s_agy, 0, sizeof(s_agy));
-    safe_copy_str(s_agy.timezone, sizeof(s_agy.timezone), DEFAULT_AGY_TZ);
-    s_agy.wc_font_mode = 0;
-    s_agy.idle_clock_sec = 0;
-    s_agy.idle_clock_view = 0;
+    memset(&s_clock, 0, sizeof(s_clock));
+    safe_copy_str(s_clock.timezone, sizeof(s_clock.timezone), DEFAULT_CLOCK_TZ);
+    s_clock.wc_font_mode = 0;
+    s_clock.idle_clock_sec = 0;
 }
 
 static esp_err_t save_blob_locked(const char *key, const void *data, size_t len)
@@ -141,9 +140,9 @@ static esp_err_t save_meta_locked(void)
     return save_blob_locked(NVS_KEY_META, &s_cfg.meta, sizeof(s_cfg.meta));
 }
 
-static esp_err_t save_agy_locked(void)
+static esp_err_t save_clock_locked(void)
 {
-    return save_blob_locked(NVS_KEY_AGY, &s_agy, sizeof(s_agy));
+    return save_blob_locked(NVS_KEY_CLOCK, &s_clock, sizeof(s_clock));
 }
 
 static esp_err_t save_all_locked(void)
@@ -237,30 +236,27 @@ esp_err_t app_config_init(void)
         save_all_locked();
     }
 
-    bool agy_loaded = false;
+    bool clock_loaded = false;
     err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
     if (err == ESP_OK) {
-        size_t agy_size = sizeof(s_agy);
-        err = nvs_get_blob(handle, NVS_KEY_AGY, &s_agy, &agy_size);
-        if (err == ESP_OK && agy_size == sizeof(s_agy)) {
-            s_agy.timezone[sizeof(s_agy.timezone) - 1] = '\0';
-            if (s_agy.timezone[0] == '\0') {
-                safe_copy_str(s_agy.timezone, sizeof(s_agy.timezone), DEFAULT_AGY_TZ);
+        size_t clock_size = sizeof(s_clock);
+        err = nvs_get_blob(handle, NVS_KEY_CLOCK, &s_clock, &clock_size);
+        if (err == ESP_OK && clock_size == sizeof(s_clock)) {
+            s_clock.timezone[sizeof(s_clock.timezone) - 1] = '\0';
+            if (s_clock.timezone[0] == '\0') {
+                safe_copy_str(s_clock.timezone, sizeof(s_clock.timezone), DEFAULT_CLOCK_TZ);
             }
-            s_agy.oauth_client_id[sizeof(s_agy.oauth_client_id) - 1] = '\0';
-            s_agy.oauth_client_secret[sizeof(s_agy.oauth_client_secret) - 1] = '\0';
-            s_agy.oauth_refresh_token[sizeof(s_agy.oauth_refresh_token) - 1] = '\0';
-            agy_loaded = true;
-            ESP_LOGI(TAG, "Loaded agy config from NVS (tz='%s', idle=%us)",
-                     s_agy.timezone, (unsigned)s_agy.idle_clock_sec);
+            clock_loaded = true;
+            ESP_LOGI(TAG, "Loaded clock config from NVS (tz='%s', idle=%us)",
+                     s_clock.timezone, (unsigned)s_clock.idle_clock_sec);
         }
         nvs_close(handle);
     }
 
-    if (!agy_loaded) {
-        ESP_LOGI(TAG, "Initializing default agy config (tz='%s')", DEFAULT_AGY_TZ);
-        load_agy_defaults_locked();
-        save_agy_locked();
+    if (!clock_loaded) {
+        ESP_LOGI(TAG, "Initializing default clock config (tz='%s')", DEFAULT_CLOCK_TZ);
+        load_clock_defaults_locked();
+        save_clock_locked();
     }
 
     xSemaphoreGive(s_cfg_mutex);
@@ -476,27 +472,23 @@ esp_err_t app_config_set_brightness(uint8_t brightness)
     return err;
 }
 
-void app_config_get_agy(app_agy_config_t *out_agy)
+void app_config_get_clock(app_clock_config_t *out_clock)
 {
-    if (!out_agy) return;
+    if (!out_clock) return;
     xSemaphoreTake(s_cfg_mutex, portMAX_DELAY);
-    memcpy(out_agy, &s_agy, sizeof(app_agy_config_t));
+    memcpy(out_clock, &s_clock, sizeof(app_clock_config_t));
     xSemaphoreGive(s_cfg_mutex);
 }
 
-esp_err_t app_config_set_agy(const app_agy_config_t *agy)
+esp_err_t app_config_set_clock(const app_clock_config_t *clock)
 {
-    if (!agy) return ESP_ERR_INVALID_ARG;
+    if (!clock) return ESP_ERR_INVALID_ARG;
     xSemaphoreTake(s_cfg_mutex, portMAX_DELAY);
-    safe_copy_str(s_agy.timezone, sizeof(s_agy.timezone),
-                  (agy->timezone[0] != '\0') ? agy->timezone : DEFAULT_AGY_TZ);
-    s_agy.wc_font_mode = agy->wc_font_mode;
-    s_agy.idle_clock_sec = agy->idle_clock_sec;
-    s_agy.idle_clock_view = agy->idle_clock_view;
-    safe_copy_str(s_agy.oauth_client_id, sizeof(s_agy.oauth_client_id), agy->oauth_client_id);
-    safe_copy_str(s_agy.oauth_client_secret, sizeof(s_agy.oauth_client_secret), agy->oauth_client_secret);
-    safe_copy_str(s_agy.oauth_refresh_token, sizeof(s_agy.oauth_refresh_token), agy->oauth_refresh_token);
-    esp_err_t err = save_agy_locked();
+    safe_copy_str(s_clock.timezone, sizeof(s_clock.timezone),
+                  (clock->timezone[0] != '\0') ? clock->timezone : DEFAULT_CLOCK_TZ);
+    s_clock.wc_font_mode = clock->wc_font_mode;
+    s_clock.idle_clock_sec = clock->idle_clock_sec;
+    esp_err_t err = save_clock_locked();
     xSemaphoreGive(s_cfg_mutex);
     return err;
 }
@@ -504,8 +496,8 @@ esp_err_t app_config_set_agy(const app_agy_config_t *agy)
 esp_err_t app_config_set_wc_font(uint8_t font_mode)
 {
     xSemaphoreTake(s_cfg_mutex, portMAX_DELAY);
-    s_agy.wc_font_mode = font_mode;
-    esp_err_t err = save_agy_locked();
+    s_clock.wc_font_mode = font_mode;
+    esp_err_t err = save_clock_locked();
     xSemaphoreGive(s_cfg_mutex);
     return err;
 }

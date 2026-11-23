@@ -55,9 +55,9 @@ void sntp_time_restart(void)
 esp_err_t sntp_time_init(sntp_sync_cb_t cb)
 {
     s_sync_cb = cb;
-    app_agy_config_t agy;
-    app_config_get_agy(&agy);
-    sntp_time_update_tz(agy.timezone);
+    app_clock_config_t clk;
+    app_config_get_clock(&clk);
+    sntp_time_update_tz(clk.timezone);
     sntp_time_restart();
     return ESP_OK;
 }
